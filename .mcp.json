@@ -1,0 +1,19 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "cachelayer-token",
+      "description": "CacheLayer connect token (from your CacheLayer dashboard)",
+      "password": true
+    }
+  ],
+  "mcpServers": {
+    "cachelayer": {
+      "type": "http",
+      "url": "https://api.cachelayer.org/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:cachelayer-token}"
+      }
+    }
+  }
+}

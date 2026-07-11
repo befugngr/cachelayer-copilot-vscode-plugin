@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "bash scripts/pre_tool_use.sh",
+        "windows": "powershell -File scripts\\pre_tool_use.ps1",
+        "timeout": 5
+      }
+    ]
+  }
+}
