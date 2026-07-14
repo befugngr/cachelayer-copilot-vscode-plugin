@@ -1,7 +1,6 @@
 # CacheLayer for GitHub Copilot (VS Code)
 
-Step caching for Copilot **agent** tools on a Copilot subscription (managed keys). Reuses prior safe steps via MCP tools and a PreToolUse hook. Does **not** intercept or cache model inference — that traffic is unreachable on managed keys.
-
+Step caching for Copilot **agent** tools on a Copilot subscription (managed keys). Reuses prior safe steps via MCP tools and a PreToolUse hook. 
 Site: https://cachelayer.org/
 
 ## Prerequisites
