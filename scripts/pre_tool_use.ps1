@@ -1,9 +1,9 @@
 # CacheLayer PreToolUse hook for GitHub Copilot / VS Code (Windows, fail-open).
-# Env: CACHELAYER_TOKEN
+# Env: CACHELAYER_KEY (legacy CACHELAYER_TOKEN / CACHELAYER_CONNECT_TOKEN accepted)
 $ErrorActionPreference = 'SilentlyContinue'
 $Url = if ($env:CACHELAYER_HOOK_URL) { $env:CACHELAYER_HOOK_URL } else { 'https://api.cachelayer.org/hooks/pre-tool-use' }
-$Token = if ($env:CACHELAYER_TOKEN) { $env:CACHELAYER_TOKEN } else { '' }
-$TimeoutSec = 2
+$Token = if ($env:CACHELAYER_KEY) { $env:CACHELAYER_KEY } elseif ($env:CACHELAYER_TOKEN) { $env:CACHELAYER_TOKEN } elseif ($env:CACHELAYER_CONNECT_TOKEN) { $env:CACHELAYER_CONNECT_TOKEN } else { '' }
+$TimeoutSec = 5
 if ($env:CACHELAYER_HOOK_TIMEOUT_S) { [void][int]::TryParse($env:CACHELAYER_HOOK_TIMEOUT_S, [ref]$TimeoutSec) }
 
 $InputJson = [Console]::In.ReadToEnd()

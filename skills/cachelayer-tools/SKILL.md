@@ -10,6 +10,8 @@ description: >-
 
 This skill caches **agent steps** (tool work), not model inference. On a Copilot subscription the model transport is unreachable — do not imply otherwise.
 
+Hook auth uses env `CACHELAYER_KEY` (`clct_<your-token>`). MCP prompts for the same token via `${input:cachelayer-token}`.
+
 ## Shared descriptor normalization (MUST match hook + MCP)
 
 Lowercase, trimmed, **verb + target**:

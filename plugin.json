@@ -3,6 +3,10 @@
   "description": "CacheLayer step caching for GitHub Copilot agents in VS Code. Reuse prior steps instead of recomputing. Requires a CacheLayer account.",
   "version": "1.0.0",
   "author": { "name": "CacheLayer", "url": "https://cachelayer.org" },
+  "homepage": "https://cachelayer.org/",
+  "repository": "https://github.com/befugngr/cachelayer-copilot-vscode-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["cache", "mcp", "copilot", "vscode", "agents"],
   "skills": "skills/",
   "hooks": "hooks.json",
   "mcpServers": ".mcp.json"

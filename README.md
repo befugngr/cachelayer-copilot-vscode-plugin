@@ -5,13 +5,28 @@ Site: https://cachelayer.org/
 
 ## Prerequisites
 
-- VS Code with GitHub Copilot (agent mode)
-- A CacheLayer account and connect token (`clct_...`)
+- VS Code (1.99+ for MCP support)
+- GitHub Copilot extension
+- A CacheLayer account and connect token (`clct_<your-token>`)
+- **python3** (3.7+) on PATH — used by the PreToolUse hook on macOS/Linux
+- On Windows: PowerShell 5+ (already installed) — the `.ps1` hook is used instead
 
 ## Install
 
-1. Command Palette → **Chat: Install Plugin From Source** → paste this repo URL.
-2. Or map a local clone in settings:
+Install via VS Code Command Palette:
+
+1. Open Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
+2. Run **Chat: Install Plugin From Source**
+3. Paste: `https://github.com/befugngr/cachelayer-copilot-vscode-plugin`
+4. Reload VS Code
+
+Prerequisite setting:
+
+```json
+"chat.plugins.enabled": true
+```
+
+Or map a local clone:
 
 ```json
 "chat.pluginLocations": {
@@ -19,18 +34,18 @@ Site: https://cachelayer.org/
 }
 ```
 
-3. Reload / enable the plugin. Confirm under **Agent Plugins - Installed**.
+Confirm under **Agent Plugins - Installed**.
 
 ## Token provisioning
 
 **MCP:** On first use VS Code prompts for the CacheLayer connect token (`inputs` → `${input:cachelayer-token}` in `.mcp.json`). Stored securely (`password: true`).
 
-**Hook:** set env `CACHELAYER_TOKEN` (never commit the value):
+**Hook:** set env `CACHELAYER_KEY` (never commit the value):
 
 | OS | How |
 |----|-----|
-| macOS / Linux | `export CACHELAYER_TOKEN=clct_...` in shell profile, or set in the environment that launches VS Code |
-| Windows | System Properties → Environment Variables, or `$env:CACHELAYER_TOKEN="clct_..."` before starting VS Code |
+| macOS / Linux | `export CACHELAYER_KEY=clct_<your-token>` in shell profile, or set in the environment that launches VS Code |
+| Windows | System Properties → Environment Variables, or `$env:CACHELAYER_KEY="clct_<your-token>"` before starting VS Code |
 
 Unauthenticated MCP/hook API calls return **401**. The hook **fail-opens** (allows the tool) on missing token, timeout, or non-2xx so the agent never blocks on CacheLayer.
 
@@ -74,5 +89,3 @@ https://cachelayer.org/
 ## Legal
 
 Apache License 2.0. See `LICENSE`.
-
-<!-- Forward compat: OAuth via .mcp.json oauth:{clientId} — not implemented in v1.0.0 -->

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # CacheLayer PreToolUse hook for GitHub Copilot / VS Code (fail-open).
-# Env: CACHELAYER_TOKEN (required for caching; missing → allow, exit 0)
+# Env: CACHELAYER_KEY (required for caching; missing → allow, exit 0)
+# Legacy: CACHELAYER_TOKEN / CACHELAYER_CONNECT_TOKEN still accepted.
 # No CLAUDE_PLUGIN_ROOT — Copilot format. Script uses BASH_SOURCE for self-location.
 set -u
 
 URL="${CACHELAYER_HOOK_URL:-https://api.cachelayer.org/hooks/pre-tool-use}"
-TOKEN="${CACHELAYER_TOKEN:-}"
-TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-2}"
+TOKEN="${CACHELAYER_KEY:-${CACHELAYER_TOKEN:-${CACHELAYER_CONNECT_TOKEN:-}}}"
+TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-5}"
 
 INPUT="$(cat || true)"
 if [[ -z "$INPUT" ]]; then
