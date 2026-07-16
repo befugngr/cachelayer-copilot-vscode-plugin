@@ -1,105 +1,83 @@
-# CacheLayer for GitHub Copilot (VS Code)
+# CacheLayer for GitHub Copilot in VS Code
 
-Step caching for Copilot **agent** tools (managed keys). Reuses prior safe steps via MCP tools and a PreToolUse hook. Does **not** intercept or cache model inference.
+Cache completed agent steps and reuse them in future tasks.
 
-Site: https://cachelayer.org/
+## Requirements
 
-## Prerequisites
+- VS Code with GitHub Copilot agent mode
+- A CacheLayer connect token (`clct_...`) from https://cachelayer.org/
 
-- VS Code (1.99+ for MCP support)
-- GitHub Copilot extension (agent mode)
-- A **CacheLayer account** and connect token (`clct_…`) — required; MCP returns **401** without it
-- **python3** (3.7+) on PATH — PreToolUse hook on macOS/Linux
-- On Windows: PowerShell 5+ (bundled `.ps1` hook)
+## Install
 
-## 1. Get a connect token
+1. Enable plugins in VS Code settings:
 
-1. Sign up or sign in at https://cachelayer.org/
-2. Create a connect token from your account (API: `POST /user/connect-token` while logged in)
-3. Copy the full value once — it looks like `clct_<your-token>`
+   ```json
+   "chat.plugins.enabled": true
+   ```
 
-You will paste it into VS Code’s MCP prompt and set `CACHELAYER_KEY` for the hook.
+2. Open the Command Palette.
+3. Run **Chat: Install Plugin From Source**.
+4. Paste:
 
-## 2. Install
+   ```text
+   https://github.com/befugngr/cachelayer-copilot-vscode-plugin
+   ```
 
-Enable plugins in settings if needed:
+5. Reload VS Code.
 
-```json
-"chat.plugins.enabled": true
+## Authenticate the MCP server
+
+1. Open the Command Palette.
+2. Run **GitHub Copilot: List MCP Servers**.
+3. Select `cachelayer`.
+4. Click **Show Configuration**.
+5. Make sure the authorization header is:
+
+   ```json
+   "Authorization": "Bearer ${input:cachelayer-token}"
+   ```
+
+6. Start or restart the server.
+7. When prompted, paste your `clct_...` token.
+
+## Authenticate the hook
+
+Use the same `clct_...` token. The hook reads it from `CACHELAYER_KEY`.
+
+### Windows
+
+Run this in PowerShell:
+
+```powershell
+[Environment]::SetEnvironmentVariable("CACHELAYER_KEY", "clct_<your-token>", "User")
 ```
 
-Then:
+Close every VS Code window, then reopen VS Code.
 
-1. Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
-2. **Chat: Install Plugin From Source**
-3. Paste: `https://github.com/befugngr/cachelayer-copilot-vscode-plugin`
-4. Reload VS Code
+### macOS
 
-Local clone mapping:
+Run this in Terminal:
 
-```json
-"chat.pluginLocations": {
-  "/absolute/path/to/cachelayer-copilot-vscode-plugin": true
-}
+```bash
+echo 'export CACHELAYER_KEY="clct_<your-token>"' >> ~/.zshrc
+source ~/.zshrc
+code
 ```
 
-Confirm under **Agent Plugins - Installed**.
+### Linux
 
-## 3. Auth (required)
+For Bash:
 
-**MCP:** On first use VS Code prompts for the connect token (`.mcp.json` → `${input:cachelayer-token}`, stored securely). That becomes:
+```bash
+echo 'export CACHELAYER_KEY="clct_<your-token>"' >> ~/.bashrc
+source ~/.bashrc
+code
+```
 
-`Authorization: Bearer <token>` → `https://api.cachelayer.org/mcp`
+For Zsh, use `~/.zshrc` instead.
 
-**Hook:** also set `CACHELAYER_KEY` in the environment that launches VS Code (hooks cannot use the MCP input secret):
+## Verify
 
-| OS | How |
-|----|-----|
-| macOS / Linux | `export CACHELAYER_KEY='clct_<your-token>'` in shell profile, then launch VS Code from that environment |
-| Windows | System Properties → Environment Variables, or `$env:CACHELAYER_KEY='clct_<your-token>'` before starting VS Code |
-
-Hook URL: `https://api.cachelayer.org/hooks/pre-tool-use` (fail-open, 5s timeout).
-
-Missing MCP token → **401**. Missing hook token / downtime → fail-open (agent continues; no cache).
-
-## 4. Verify
-
-- **Agent Plugins - Installed** lists `cachelayer`
-- **MCP: List Servers** shows `cachelayer`
-- **Configure Tools** shows `lookup_step`, `save_step`, `check_conflict`, `run_status`
-- **Configure Skills** shows `cachelayer-tools`
-- **GitHub Copilot Chat Hooks** output channel shows PreToolUse activity
-- A test `lookup_step` does not return unauthorized / 401
-
-## Tools
-
-- `lookup_step(description, run_id)` before a step; on hit reuse `result`
-- `save_step(step_id, run_id, description, result)` after a step
-- `check_conflict(intended_action, run_id)` before edits
-- `run_status(run_id)` after interruption
-
-One UUID `run_id` per task. Descriptors: lowercase verb + target (`read file src/auth.ts`).
-
-## Hardening
-
-Do not enable `chat.tools.edits.autoApprove` for this plugin’s hook scripts (`scripts/pre_tool_use.sh`, `scripts/pre_tool_use.ps1`).
-
-## Limits
-
-- Fail-open: CacheLayer down / slow / 401 on the hook → agent continues without cache
-- Write/mutating tool results are not served as replayable
-- Not model-call caching
-
-## Compliance
-
-1. **No impersonation.** CacheLayer only; not GitHub, Microsoft, or Copilot.
-2. **No malicious code.**
-3. **Transparent requirement.** A CacheLayer account/subscription is required.
-
-## Contact
-
-https://cachelayer.org/
-
-## Legal
-
-Apache License 2.0. See `LICENSE`.
+- **GitHub Copilot: List MCP Servers** shows `cachelayer` as running.
+- **Configure Tools** shows `lookup_step`, `save_step`, `check_conflict`, and `run_status`.
+- **Configure Skills** shows `cachelayer-tools`.
