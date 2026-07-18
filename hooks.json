@@ -5,7 +5,14 @@
         "type": "command",
         "command": "bash scripts/pre_tool_use.sh",
         "windows": "powershell -File scripts\\pre_tool_use.ps1",
-        "timeout": 5
+        "timeout": 3
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "bash scripts/post_tool_use.sh",
+        "timeout": 3
       }
     ]
   }

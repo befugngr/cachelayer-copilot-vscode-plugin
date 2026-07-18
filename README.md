@@ -42,6 +42,8 @@ Cache completed agent steps and reuse them in future tasks.
 
 ## Authenticate the hook
 
+Hooks use the same token (`CACHELAYER_KEY`). PreToolUse looks up; PostToolUse saves. Fail-open (~2s). Prefer hooks over calling MCP before every tool.
+
 Use the same `clct_...` token. The hook reads it from `CACHELAYER_KEY`.
 
 ### Windows

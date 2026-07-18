@@ -7,7 +7,7 @@ set -u
 
 URL="${CACHELAYER_HOOK_URL:-https://api.cachelayer.org/hooks/pre-tool-use}"
 TOKEN="${CACHELAYER_KEY:-${CACHELAYER_TOKEN:-${CACHELAYER_CONNECT_TOKEN:-}}}"
-TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-5}"
+TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-2}"
 
 INPUT="$(cat || true)"
 if [[ -z "$INPUT" ]]; then
