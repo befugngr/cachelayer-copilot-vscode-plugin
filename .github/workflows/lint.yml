@@ -1,0 +1,34 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate JSON manifests
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          for p in ["plugin.json", ".mcp.json", "hooks.json"]:
+              with open(p) as f:
+                  json.load(f)
+              print(f"OK json {p}")
+          required = {"name", "description", "version", "author", "homepage", "repository", "license", "keywords"}
+          with open("plugin.json") as f:
+              plug = json.load(f)
+          missing = required - set(plug)
+          if missing:
+              print("Missing plugin.json fields:", sorted(missing), file=sys.stderr)
+              sys.exit(1)
+          print("OK plugin.json required fields")
+          PY
+      - name: Bash syntax check
+        run: bash -n scripts/pre_tool_use.sh
+      - name: Markdown presence
+        run: test -f README.md && test -f skills/cachelayer-tools/SKILL.md
+      - name: BUILD_REPORT must not be committed
+        run: test ! -f BUILD_REPORT.md

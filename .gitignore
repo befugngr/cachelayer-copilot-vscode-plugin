@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+.env
+.env.*
+*.pem
+*.key
+.secrets/
+.connect_token
+**/clct_*
+__pycache__/
+*.pyc
+node_modules/
+.vscode-test/
+.idea/
+.vscode/
+BUILD_REPORT.md
