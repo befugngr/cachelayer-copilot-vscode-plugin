@@ -1,0 +1,225 @@
+"""Shared helpers for local coding-agent tools. Stdlib only."""
+from __future__ import annotations
+
+import json
+import os
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+MAX_TOOL_CHARS = 3500
+HOOK_MAX_CHARS = 1800
+DEFAULT_TIMEOUT_S = 20
+HOOK_TIMEOUT_S = 6
+MAX_CAPTURE_BYTES = 256_000
+
+CODE_EXTS = {
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".java", ".kt", ".kts", ".go", ".rs",
+}
+
+SKIP_PARTS = {
+    "node_modules", ".git", "dist", "build", ".venv", "venv",
+    "__pycache__", ".tox", "target", "coverage",
+}
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def workspace_root(cwd: str | None = None) -> Path:
+    p = Path(cwd or os.getcwd()).resolve()
+    if p.is_file():
+        p = p.parent
+    for cand in [p, *p.parents]:
+        if any((cand / m).exists() for m in (
+            ".git", "pyproject.toml", "package.json", "pom.xml",
+            "build.gradle", "build.gradle.kts", "Cargo.toml", "go.mod",
+        )):
+            return cand
+        if cand.parent == cand:
+            break
+    return p
+
+
+def is_code_path(path: str | Path) -> bool:
+    p = Path(path)
+    if p.suffix.lower() not in CODE_EXTS:
+        return False
+    parts = set(p.parts)
+    return not (parts & SKIP_PARTS)
+
+
+def cap_text(text: str, limit: int = MAX_TOOL_CHARS) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20].rstrip() + "\n…[truncated]"
+
+
+def capped_json(data: Any, limit: int = MAX_TOOL_CHARS) -> str:
+    """Serialize to valid JSON while bounding the MCP text payload."""
+    value = deepcopy(data)
+    for _ in range(20):
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+        if len(text) <= limit:
+            return text
+        strings: list[tuple[int, tuple[Any, ...]]] = []
+
+        def visit(item: Any, path: tuple[Any, ...] = ()) -> None:
+            if isinstance(item, str):
+                strings.append((len(item), path))
+            elif isinstance(item, dict):
+                for key, child in item.items():
+                    visit(child, path + (key,))
+            elif isinstance(item, list):
+                for index, child in enumerate(item):
+                    visit(child, path + (index,))
+
+        visit(value)
+        if not strings:
+            break
+        _, path = max(strings)
+        if not path:
+            break
+        parent = value
+        for part in path[:-1]:
+            parent = parent[part]
+        key = path[-1]
+        old = parent[key]
+        keep = max(80, len(old) // 2)
+        parent[key] = cap_text(old, keep)
+    return json.dumps(
+        {"ok": False, "truncated": True, "summary": "tool result exceeded output cap"},
+        separators=(",", ":"),
+    )
+
+
+def run_cmd(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int = DEFAULT_TIMEOUT_S,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+) -> dict[str, Any]:
+    if not argv or not argv[0]:
+        return {"ok": False, "code": 127, "output": "empty command", "argv": argv, "available": False}
+    creationflags = 0
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        with tempfile.TemporaryFile() as output:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd) if cwd else None,
+                stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, **(env or {})},
+                creationflags=creationflags,
+                **popen_kwargs,
+            )
+            try:
+                proc.communicate(
+                    input=input_text.encode("utf-8") if input_text is not None else None,
+                    timeout=max(1, timeout),
+                )
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+                proc.communicate()
+                return {
+                    "ok": False,
+                    "code": 124,
+                    "output": f"timeout after {timeout}s: {format_argv(argv[:4])}",
+                    "argv": argv,
+                    "timeout": True,
+                }
+            output.seek(0, os.SEEK_END)
+            size = output.tell()
+            truncated = size > MAX_CAPTURE_BYTES
+            if truncated:
+                half = MAX_CAPTURE_BYTES // 2
+                output.seek(0)
+                first = output.read(half)
+                output.seek(max(0, size - half))
+                raw = first + b"\n...[command output truncated]...\n" + output.read(half)
+            else:
+                output.seek(0)
+                raw = output.read()
+        out = raw.decode("utf-8", errors="replace").strip()
+        return {
+            "ok": proc.returncode == 0,
+            "code": proc.returncode,
+            "output": out,
+            "argv": argv,
+            "truncated": truncated,
+        }
+    except (FileNotFoundError, PermissionError) as exc:
+        return {
+            "ok": False,
+            "code": 127,
+            "output": f"cannot execute {argv[0]}: {exc}",
+            "argv": argv,
+            "available": False,
+        }
+    except OSError as exc:
+        return {"ok": False, "code": 126, "output": f"command failed to start: {exc}", "argv": argv}
+
+
+def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name == "nt":
+            proc.kill()
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def format_argv(argv: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    import shlex
+    return shlex.join(argv)
+
+
+def git_changed_files(root: Path) -> list[str]:
+    r = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD", "--"], cwd=root, timeout=8)
+    if not r.get("ok"):
+        r = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "--"], cwd=root, timeout=8)
+    files = []
+    for line in (r.get("output") or "").splitlines():
+        line = line.strip()
+        if line and is_code_path(line):
+            files.append(line)
+    return files
+
+
+def rel_to_root(path: str | Path, root: Path) -> str:
+    p = Path(path)
+    try:
+        resolved = p.resolve() if p.is_absolute() else (root / p).resolve()
+        return resolved.relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return ""
+
+
+def dump(data: dict[str, Any]) -> str:
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def py_bin() -> str:
+    return sys.executable or "python3"

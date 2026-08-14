@@ -1,12 +1,21 @@
 {
   "name": "cachelayer",
   "description": "CacheLayer managed keys for GitHub Copilot in VS Code. Connect token (CACHELAYER_KEY) enables step caching via hooks and MCP.",
-  "version": "1.0.1",
-  "author": { "name": "CacheLayer", "url": "https://cachelayer.org" },
+  "version": "1.0.2",
+  "author": {
+    "name": "CacheLayer",
+    "url": "https://cachelayer.org"
+  },
   "homepage": "https://cachelayer.org/",
   "repository": "https://github.com/befugngr/cachelayer-copilot-vscode-plugin",
   "license": "Apache-2.0",
-  "keywords": ["cache", "mcp", "copilot", "vscode", "agents"],
+  "keywords": [
+    "cache",
+    "mcp",
+    "copilot",
+    "vscode",
+    "agents"
+  ],
   "skills": "skills/",
   "hooks": "hooks.json",
   "mcpServers": ".mcp.json"
