@@ -7,7 +7,7 @@ description: >-
 
 # CacheLayer tools
 
-Set `CACHELAYER_KEY` to your `clct_<token>`. Existing hooks handle ordinary remote cache lookup/save.
+Set `CACHELAYER_KEY` to your `clct_<token>`. Bundled hooks handle remote cache lookup/save and lint the file after each edit, so do not spend a turn linting that file yourself.
 
 ## Local loop-cutters
 

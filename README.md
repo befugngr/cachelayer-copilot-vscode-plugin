@@ -55,3 +55,7 @@ Fully quit and reopen VS Code.
 The plugin also bundles a local, Python 3 stdlib-only MCP server alongside the managed-keys cache MCP. It provides `verify_edit` (CRITIC), `run_affected_tests` (TIA), and `debug_failure` for compact one-call feedback in the current workspace. These tools are optional: missing project analyzers degrade gracefully with install guidance, while the remote `cachelayer` server and `CACHELAYER_KEY` flow remain unchanged.
 
 For richer selection and diagnosis, projects may optionally install `pytest-testmon`/Scalpel, TypeScript/ESLint/Jest, or Java tooling such as JaCoCo, Ekstazi, Joern, Flacoco, and GZoltar.
+
+### Post-edit lint hook
+
+A `PostToolUse` hook lints the file after each edit and reports type or lint errors back to the agent in the same turn. VS Code currently ignores hook matchers and runs every hook on every tool, so the hook checks the tool name itself and stays silent for reads, searches, terminal commands, and non-code files. It is fail-open: without Python 3 or a linter it does nothing, and the cache hooks are unaffected.
