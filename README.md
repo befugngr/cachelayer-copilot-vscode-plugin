@@ -56,6 +56,19 @@ The plugin also bundles a local, Python 3 stdlib-only MCP server alongside the m
 
 For richer selection and diagnosis, projects may optionally install `pytest-testmon`/Scalpel, TypeScript/ESLint/Jest, or Java tooling such as JaCoCo, Ekstazi, Joern, Flacoco, and GZoltar.
 
+`run_affected_tests` picks the strongest selection the project supports, and says which one it used:
+
+| Project state | Selection |
+| --- | --- |
+| `pytest-testmon` installed | testmon's own impacted set |
+| `.coverage` recorded with `pytest --cov --cov-context=test` | the exact tests that executed the changed lines |
+| neither | changed modules plus their importers, mapped to matching test files |
+| Jest | `jest --findRelatedTests` |
+| Maven with a JaCoCo report | test classes referencing changed classes the suite covers, and a list of changed classes with no coverage |
+| Maven or Gradle without a report | changed classes mapped to matching test classes |
+
+When nothing maps, it runs nothing and says so rather than falling back to the full suite.
+
 ### Post-edit lint hook
 
 A `PostToolUse` hook lints the file after each edit and reports type or lint errors back to the agent in the same turn. VS Code currently ignores hook matchers and runs every hook on every tool, so the hook checks the tool name itself and stays silent for reads, searches, terminal commands, and non-code files. It is fail-open: without Python 3 or a linter it does nothing, and the cache hooks are unaffected.

@@ -9,9 +9,15 @@ from typing import Any
 
 try:
     from .detect import detect
+    from .tia_select import (
+        coverage_context_tests, jacoco_covered_classes, java_tests_referencing, python_importers,
+    )
     from .util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
 except ImportError:
     from detect import detect
+    from tia_select import (
+        coverage_context_tests, jacoco_covered_classes, java_tests_referencing, python_importers,
+    )
     from util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
 
 _FAIL_RE = re.compile(r"^(FAILED|ERROR)\s+(\S+)", re.MULTILINE)
@@ -94,8 +100,37 @@ def _python_test_candidates(root: Path, files: list[str]) -> list[str]:
     return list(dict.fromkeys(candidates))[:50]
 
 
+def _run_pytest_coverage_contexts(
+    root: Path, files: list[str], python: str, timeout: int
+) -> dict[str, Any] | None:
+    """Precise selection when coverage.py recorded which test executed each line."""
+    ctx = coverage_context_tests(root, files)
+    tests = ctx.get("tests") or []
+    if not tests:
+        return None
+    result = run_cmd([python, "-m", "pytest", "-q", "--tb=line", *tests], cwd=root, timeout=timeout)
+    payload = _pytest_result(result, "pytest-coverage-contexts", tests)
+    payload["selection_sources"] = ["coverage-contexts"]
+    payload["coverage_contexts_used"] = True
+    return payload
+
+
 def _run_pytest_mapped(root: Path, files: list[str], python: str, timeout: int) -> dict[str, Any]:
+    sources: list[str] = []
     tests = _python_test_candidates(root, files)
+    if tests:
+        sources.append("name-map")
+
+    # Forward slice: a changed module is also exercised through its importers.
+    slice_info = python_importers(root, files)
+    importers = [f for f in slice_info.get("files") or [] if f not in files]
+    if importers:
+        extra = [t for t in _python_test_candidates(root, importers) if t not in tests]
+        if extra:
+            tests.extend(extra)
+            sources.append("import-graph")
+
+    coverage_hint = coverage_context_tests(root, files)
     if not tests:
         return {
             "ok": True,
@@ -105,11 +140,19 @@ def _run_pytest_mapped(root: Path, files: list[str], python: str, timeout: int) 
             "skipped_estimate": None,
             "tests": [],
             "failures": "",
+            "selection_sources": [],
+            "coverage_contexts_used": False,
             "summary": "No safely mapped pytest tests; full suite was not run.",
-            "install": "Install pytest-testmon for coverage-guided selection: pip install pytest-testmon",
+            "install": coverage_hint.get("install")
+            or "pip install pytest-testmon, or record contexts with pytest --cov --cov-context=test",
         }
-    result = run_cmd([python, "-m", "pytest", "-q", "--tb=line", *tests], cwd=root, timeout=timeout)
-    return _pytest_result(result, "pytest-mapped", tests)
+    result = run_cmd([python, "-m", "pytest", "-q", "--tb=line", *tests[:50]], cwd=root, timeout=timeout)
+    payload = _pytest_result(result, "pytest-mapped", tests)
+    payload["selection_sources"] = sources
+    payload["coverage_contexts_used"] = False
+    if coverage_hint.get("install"):
+        payload["install"] = coverage_hint["install"]
+    return payload
 
 
 def _jest_command(root: Path) -> list[str] | None:
@@ -167,11 +210,33 @@ def _java_test_classes(root: Path, files: list[str]) -> list[str]:
     return list(dict.fromkeys(tests))[:40]
 
 
+def _jacoco_expansion(root: Path, info: dict[str, Any], files: list[str]) -> dict[str, Any]:
+    """Use a JaCoCo report to select tests that touch changed classes the suite covers."""
+    if not info["flags"].get("jacoco"):
+        return {"tests": [], "parsed": False, "uncovered": [], "report": None}
+    report = jacoco_covered_classes(root)
+    if not report.get("parsed"):
+        return {"tests": [], "parsed": False, "uncovered": [], "report": None, "reason": report.get("reason")}
+    refs = java_tests_referencing(root, files, report.get("covered") or set())
+    return {
+        "tests": refs["tests"],
+        "parsed": True,
+        "uncovered": refs["uncovered"],
+        "report": report.get("report"),
+    }
+
+
 def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int) -> dict[str, Any]:
     mvn = info["tools"].get("mvn")
     if not mvn:
         return {"ok": False, "available": False, "runner": "maven", "install": "Install Maven or add mvnw/mvnw.cmd."}
     tests = _java_test_classes(root, files)
+    sources = ["name-map"] if tests else []
+    jacoco = _jacoco_expansion(root, info, files)
+    extra = [t for t in jacoco["tests"] if t not in tests]
+    if extra:
+        tests.extend(extra)
+        sources.append("jacoco-reference-expansion")
     ekstazi_db = (root / ".ekstazi").exists()
     if info["flags"].get("ekstazi") and ekstazi_db:
         result = run_cmd([mvn, "-q", "-DfailIfNoTests=false", "test"], cwd=root, timeout=timeout)
@@ -188,20 +253,27 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     else:
         return {
             "ok": True, "available": True, "runner": "maven-surefire-subset", "selected": 0,
-            "skipped_estimate": None, "tests": [],
+            "skipped_estimate": None, "tests": [], "selection_sources": [],
             "summary": "No safely mapped Java tests; full suite was not run.",
             "jacoco_detected": bool(info["flags"].get("jacoco")),
+            "jacoco_report_parsed": jacoco["parsed"],
+            "jacoco_used_for_selection": False,
+            "uncovered_changed_classes": jacoco["uncovered"],
             "ekstazi_detected": bool(info["flags"].get("ekstazi")),
-            "install": "Configure Ekstazi and establish its dependency database for incremental selection.",
+            "install": "Configure Ekstazi, or generate a JaCoCo report so changed classes can be expanded to tests.",
         }
     output = result.get("output") or ""
     return {
         "ok": bool(result.get("ok")), "runner": runner, "selected": selected,
         "skipped_estimate": None, "tests": tests,
+        "selection_sources": sources if runner == "maven-surefire-subset" else ["ekstazi"],
         "failures": cap_text(output, 2500) if not result.get("ok") else "",
         "summary": cap_text(next((line for line in reversed(output.splitlines()) if line.strip()), ""), 400),
         "jacoco_detected": bool(info["flags"].get("jacoco")),
-        "jacoco_used_for_selection": False,
+        "jacoco_report_parsed": jacoco["parsed"],
+        "jacoco_report": jacoco.get("report"),
+        "jacoco_used_for_selection": bool(extra),
+        "uncovered_changed_classes": jacoco["uncovered"],
         "ekstazi_detected": bool(info["flags"].get("ekstazi")),
         "timed_out": bool(result.get("timeout")),
     }
@@ -251,7 +323,10 @@ def run_affected_tests(
         elif info["flags"].get("testmon"):
             result = _run_pytest_testmon(root, python, timeout)
         else:
-            result = _run_pytest_mapped(root, files, python, timeout)
+            result = (
+                _run_pytest_coverage_contexts(root, files, python, timeout)
+                or _run_pytest_mapped(root, files, python, timeout)
+            )
         result["changed_files"] = files[:30]
         return result
 
