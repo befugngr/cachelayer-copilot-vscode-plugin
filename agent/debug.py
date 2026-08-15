@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import math
+import os
 import re
+import tempfile
 import xml.etree.ElementTree as ET
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +132,123 @@ def python_enclosing_slice(root: Path, file: str, line: int) -> dict[str, Any]:
     }
 
 
+def _ast_names(node: ast.AST, context: type[ast.expr_context]) -> set[str]:
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, context)
+    }
+
+
+def python_backward_slice(root: Path, file: str, line: int) -> dict[str, Any] | None:
+    """Build a bounded intraprocedural def-use/control slice from a crash line."""
+    path = Path(file)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        path.resolve().relative_to(root.resolve())
+        source = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except (OSError, ValueError, SyntaxError):
+        return None
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    containing = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.stmt)
+        and getattr(node, "lineno", 0) <= line <= getattr(node, "end_lineno", 0)
+    ]
+    if not containing:
+        return None
+    criterion = min(
+        containing,
+        key=lambda node: (
+            getattr(node, "end_lineno", line) - getattr(node, "lineno", line),
+            -getattr(node, "lineno", 0),
+        ),
+    )
+
+    scope: ast.AST = criterion
+    while scope in parents and not isinstance(
+        scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    ):
+        scope = parents[scope]
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        scope = tree
+
+    statements = sorted(
+        {
+            node for node in ast.walk(scope)
+            if isinstance(node, ast.stmt)
+            and getattr(node, "lineno", 0) <= getattr(criterion, "lineno", line)
+        },
+        key=lambda node: getattr(node, "lineno", 0),
+    )
+    selected: set[ast.stmt] = {criterion}
+    needed = _ast_names(criterion, ast.Load)
+    for statement in reversed(statements):
+        if statement is criterion:
+            continue
+        defined = _ast_names(statement, ast.Store)
+        if defined & needed:
+            selected.add(statement)
+            needed = (needed - defined) | _ast_names(statement, ast.Load)
+
+    control_nodes = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith, ast.Match)
+    for statement in list(selected):
+        parent = parents.get(statement)
+        while parent is not None and parent is not scope:
+            if isinstance(parent, control_nodes):
+                selected.add(parent)
+                needed |= _ast_names(parent, ast.Load)
+            parent = parents.get(parent)
+
+    called = {
+        call.func.id
+        for statement in selected
+        for call in ast.walk(statement)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in called:
+            selected.add(node)
+
+    lines = source.splitlines()
+    rendered: list[str] = []
+    selected_lines: set[int] = set()
+    for statement in sorted(selected, key=lambda node: getattr(node, "lineno", 0)):
+        start = getattr(statement, "lineno", 0)
+        end = min(getattr(statement, "end_lineno", start), start + 30)
+        for number in range(start, end + 1):
+            if number in selected_lines or not (0 < number <= len(lines)):
+                continue
+            selected_lines.add(number)
+            mark = ">>" if number == line else "  "
+            rendered.append(f"{mark}{number:>5}| {lines[number - 1]}")
+            if len(rendered) >= 120:
+                break
+        if len(rendered) >= 120:
+            break
+    if not rendered:
+        return None
+    return {
+        "method": "ast-def-use-backward",
+        "file": file,
+        "line": line,
+        "text": cap_text("\n".join(rendered), 3500),
+        "slice_lines": len(selected_lines),
+        "original_lines": len(lines),
+        "reduction_pct": round(100 * (1 - len(selected_lines) / max(len(lines), 1)), 1),
+        "criterion_uses": sorted(_ast_names(criterion, ast.Load))[:30],
+        "unresolved_inputs": sorted(needed)[:30],
+        "interprocedural_depth": 1 if called else 0,
+    }
+
+
 def scalpel_slice(root: Path, file: str, line: int) -> dict[str, Any] | None:
     try:
         from scalpel.core.mnode import MNode  # type: ignore
@@ -155,26 +276,86 @@ def joern_slice(root: Path, file: str, line: int, var: str | None) -> dict[str, 
     exe = which("joern-slice")
     if not exe:
         return None
-    p = Path(file)
-    if not p.is_absolute():
-        p = root / file
-    help_result = run_cmd([exe, "--help"], cwd=root, timeout=5)
-    help_text = help_result.get("output") or ""
-    if "--file" not in help_text or "--line" not in help_text:
-        return None
-    args = [exe, "--file", str(p), "--line", str(line)]
-    if var and "--var" in help_text:
-        args += ["--var", var]
-    r = run_cmd(args, cwd=root, timeout=20)
-    if r.get("available") is False:
-        return None
-    return {
-        "method": "joern-slice",
-        "file": file,
-        "line": line,
-        "text": cap_text(r.get("output") or "", 2500),
-        "ok": r.get("ok"),
-    }
+    cpg_candidates = [
+        Path(os.environ.get("JOERN_CPG", "")),
+        root / "cpg.bin",
+        root / ".joern" / "cpg.bin",
+        root / "target" / "cpg.bin",
+    ]
+    cpg = next((path for path in cpg_candidates if str(path) and path.is_file()), None)
+    if cpg is None:
+        return {
+            "available": False,
+            "method": "joern-data-flow",
+            "reason": "Joern is installed but no cpg.bin was found; run joern-parse once.",
+        }
+
+    with tempfile.TemporaryDirectory(prefix=".cachelayer-joern-", dir=root) as temp:
+        output_prefix = Path(temp) / "slice"
+        args = [
+            exe, "data-flow",
+            "--slice-depth", "8",
+            "--file-filter", re.escape(Path(file).name),
+            "--out", str(output_prefix),
+        ]
+        if var:
+            args.extend(["--sink-filter", f".*{re.escape(var)}.*"])
+        args.append(str(cpg))
+        result = run_cmd(args, cwd=root, timeout=45)
+        payload = ""
+        for candidate in Path(temp).glob("slice*.json"):
+            try:
+                payload += candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        if not payload:
+            return {
+                "available": True,
+                "method": "joern-data-flow",
+                "ok": bool(result.get("ok")),
+                "reason": cap_text(result.get("output") or "empty Joern slice", 500),
+            }
+        statements = _joern_statements(payload, file, line)
+        return {
+            "available": True,
+            "method": "joern-data-flow",
+            "file": file,
+            "line": line,
+            "text": cap_text("\n".join(statements), 3500),
+            "ok": bool(result.get("ok")),
+            "slice_lines": len(statements),
+        }
+
+
+def _joern_statements(payload: str, target_file: str, target_line: int) -> list[str]:
+    try:
+        value = json.loads(payload)
+    except ValueError:
+        return []
+    found: list[tuple[str, int, str]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            raw_line = item.get("lineNumber") or item.get("line") or item.get("line_number")
+            code = item.get("code") or item.get("label")
+            file_name = item.get("fileName") or item.get("filename") or target_file
+            try:
+                line_number = int(raw_line)
+            except (TypeError, ValueError):
+                line_number = 0
+            if line_number > 0 and isinstance(code, str) and code.strip():
+                row = (str(file_name), line_number, code.strip())
+                if row not in found:
+                    found.append(row)
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    found.sort(key=lambda row: (0 if Path(row[0]).name == Path(target_file).name else 1, abs(row[1] - target_line)))
+    return [f"{name}:{number}| {code}" for name, number, code in found[:100]]
 
 
 def ochiai(failed_cov: dict[tuple[str, int], int], passed_cov: dict[tuple[str, int], int]) -> list[dict[str, Any]]:
@@ -196,7 +377,11 @@ def _failed_test_ids(text: str) -> set[str]:
     return {item.split("[", 1)[0] for item in ids}
 
 
-def ochiai_from_coverage(root: Path, failure_text: str) -> dict[str, Any]:
+def ochiai_from_coverage(
+    root: Path,
+    failure_text: str,
+    data_file: Path | None = None,
+) -> dict[str, Any]:
     """Compute Ochiai from coverage.py's per-test dynamic contexts."""
     failed_ids = _failed_test_ids(failure_text)
     if not failed_ids:
@@ -209,7 +394,7 @@ def ochiai_from_coverage(root: Path, failure_text: str) -> dict[str, Any]:
             "method": "coverage-context-matrix",
             "install": "pip install coverage pytest-cov",
         }
-    data_file = root / ".coverage"
+    data_file = data_file or root / ".coverage"
     if not data_file.exists():
         return {
             "available": False,
@@ -269,41 +454,133 @@ def ochiai_from_coverage(root: Path, failure_text: str) -> dict[str, Any]:
         }
 
 
-def java_fault_localization(root: Path, info: dict[str, Any]) -> dict[str, Any]:
-    """Use Flacoco/GZoltar only when an executable adapter is installed."""
-    exe = info["tools"].get("flacoco") or info["tools"].get("gzoltar")
-    name = "flacoco" if info["tools"].get("flacoco") else "gzoltar"
-    if not exe:
+def generate_python_ochiai(
+    root: Path,
+    failure_text: str,
+    python: str,
+    timeout: int,
+) -> dict[str, Any]:
+    """Rerun only failing pytest files with dynamic contexts, then compute Ochiai."""
+    failed_ids = _failed_test_ids(failure_text)
+    test_files: list[str] = []
+    for node_id in sorted(failed_ids):
+        rel = node_id.split("::", 1)[0]
+        path = (root / rel).resolve()
+        try:
+            path.relative_to(root.resolve())
+        except (OSError, ValueError):
+            continue
+        if path.is_file() and rel not in test_files:
+            test_files.append(rel)
+    if not test_files:
         return {
             "available": False,
-            "method": "flacoco/gzoltar",
-            "install": "Install Flacoco or a GZoltar CLI and put it on PATH.",
+            "method": "pytest-cov-context-matrix",
+            "reason": "no local failing pytest file parsed from output",
         }
-    help_result = run_cmd([exe, "--help"], cwd=root, timeout=5)
+
+    data_file = root / ".cachelayer-debug-coverage"
+    try:
+        data_file.unlink(missing_ok=True)
+        result = run_cmd(
+            [
+                python, "-m", "pytest", "-q", "--tb=line",
+                "--cov=.", "--cov-context=test", "--cov-report=",
+                *test_files[:5],
+            ],
+            cwd=root,
+            timeout=max(1, min(timeout, 60)),
+            env={"COVERAGE_FILE": str(data_file)},
+        )
+        ranked = ochiai_from_coverage(root, failure_text, data_file)
+        ranked["runner"] = "pytest-cov"
+        ranked["test_files"] = test_files[:5]
+        ranked["test_exit_code"] = result.get("code")
+        ranked["timed_out"] = bool(result.get("timeout"))
+        if not ranked.get("available") and result.get("output"):
+            ranked["diagnostic"] = cap_text(result["output"], 600)
+        return ranked
+    finally:
+        data_file.unlink(missing_ok=True)
+
+
+def _parse_fault_locations(text: str) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for row in csv.reader((text or "").splitlines()):
+        joined = ",".join(row)
+        match = re.search(
+            r"([A-Za-z_][\w.$/\\-]*(?:\.java)?)[#:,;](\d+).*?([01](?:\.\d+)?)",
+            joined,
+        )
+        if not match:
+            continue
+        item = {
+            "file": match.group(1),
+            "line": int(match.group(2)),
+            "score": float(match.group(3)),
+        }
+        if item not in hits:
+            hits.append(item)
+    hits.sort(key=lambda item: item["score"], reverse=True)
+    return hits[:15]
+
+
+def java_fault_localization(
+    root: Path,
+    info: dict[str, Any],
+    timeout: int = 45,
+) -> dict[str, Any]:
+    """Run a configured Flacoco CLI or jar and parse suspicious locations."""
+    exe = info["tools"].get("flacoco")
+    jar = os.environ.get("FLACOCO_JAR", "")
+    java = info["tools"].get("java")
+    if exe:
+        prefix = [exe]
+    elif jar and Path(jar).is_file() and java:
+        prefix = [java, "-jar", jar]
+    else:
+        return {
+            "available": False,
+            "method": "flacoco",
+            "install": "Put flacoco on PATH or set FLACOCO_JAR to its standalone jar.",
+        }
+    help_result = run_cmd([*prefix, "--help"], cwd=root, timeout=8)
     help_text = help_result.get("output") or ""
     if "--projectpath" not in help_text:
         return {
             "available": True,
             "executed": False,
-            "method": name,
+            "method": "flacoco",
             "reason": "installed CLI has no supported --projectpath adapter",
         }
-    result = run_cmd([exe, "--projectpath", str(root)], cwd=root, timeout=30)
-    hits = []
-    for raw in (result.get("output") or "").splitlines():
-        match = re.search(r"([\w.$/\\-]+\.java):(\d+).*?([01](?:\.\d+)?)", raw)
-        if match:
-            hits.append({"file": match.group(1), "line": int(match.group(2)), "score": float(match.group(3))})
-    hits.sort(key=lambda item: item["score"], reverse=True)
-    return {
-        "available": True,
-        "executed": True,
-        "method": name,
-        "ok": bool(result.get("ok")),
-        "timeout": bool(result.get("timeout")),
-        "ranked": hits[:15],
-        "diagnostic": cap_text(result.get("output") or "", 500) if not hits else "",
-    }
+    output_file = root / ".cachelayer-flacoco.csv"
+    try:
+        output_file.unlink(missing_ok=True)
+        result = run_cmd(
+            [
+                *prefix, "--projectpath", str(root),
+                "--format", "CSV", "--output", str(output_file),
+            ],
+            cwd=root,
+            timeout=max(1, min(timeout, 120)),
+        )
+        report = ""
+        try:
+            report = output_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        hits = _parse_fault_locations(report + "\n" + (result.get("output") or ""))
+        return {
+            "available": True,
+            "executed": True,
+            "method": "flacoco",
+            "ok": bool(result.get("ok")),
+            "timeout": bool(result.get("timeout")),
+            "ranked": hits,
+            "diagnostic": cap_text(result.get("output") or "", 500) if not hits else "",
+        }
+    finally:
+        output_file.unlink(missing_ok=True)
 
 
 def ddmin(s: str, pred, max_rounds: int = 12) -> str:
@@ -395,10 +672,164 @@ def minimize_failure_blob(blob: str) -> tuple[str, dict[str, Any]]:
     reduced = ddmin(blob, preserves_evidence, max_rounds=18)
     return reduced, {
         "applied": True,
-        "method": "ddmin-evidence",
+        "method": "evidence-compression",
         "oracle": "preserves crash frame/signature; does not re-run the failure",
+        "oracle_verified": False,
         "reduction_pct": round(100 * (1 - len(reduced) / max(len(blob), 1)), 1),
     }
+
+
+def _json_delete_paths(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    paths: list[tuple[Any, ...]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            paths.append(path + (key,))
+            paths.extend(_json_delete_paths(child, path + (key,)))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            paths.append(path + (index,))
+            paths.extend(_json_delete_paths(child, path + (index,)))
+    return sorted(paths, key=len, reverse=True)
+
+
+def _delete_json_path(value: Any, path: tuple[Any, ...]) -> Any:
+    candidate = deepcopy(value)
+    parent = candidate
+    for part in path[:-1]:
+        parent = parent[part]
+    last = path[-1]
+    if isinstance(parent, dict):
+        parent.pop(last, None)
+    elif isinstance(parent, list) and isinstance(last, int) and 0 <= last < len(parent):
+        parent.pop(last)
+    return candidate
+
+
+def _hdd_json_repro(text: str, interesting, max_runs: int) -> str:
+    try:
+        current = json.loads(text)
+    except ValueError:
+        return text
+    changed = True
+    while changed and interesting.runs < max_runs:
+        changed = False
+        for path in _json_delete_paths(current):
+            candidate = _delete_json_path(current, path)
+            encoded = json.dumps(candidate, separators=(",", ":"))
+            if interesting(encoded):
+                current = candidate
+                changed = True
+                break
+            if interesting.runs >= max_runs:
+                break
+    return json.dumps(current, indent=2)
+
+
+def _hdd_xml_repro(text: str, interesting, max_runs: int) -> str:
+    try:
+        current = ET.fromstring(text)
+    except ET.ParseError:
+        return text
+    changed = True
+    while changed and interesting.runs < max_runs:
+        changed = False
+        parents = list(current.iter())
+        for parent_index in range(len(parents) - 1, -1, -1):
+            parent = parents[parent_index]
+            for child_index in range(len(list(parent)) - 1, -1, -1):
+                candidate = ET.fromstring(ET.tostring(current, encoding="unicode"))
+                candidate_parents = list(candidate.iter())
+                if parent_index >= len(candidate_parents):
+                    continue
+                candidate_parent = candidate_parents[parent_index]
+                children = list(candidate_parent)
+                if child_index >= len(children):
+                    continue
+                candidate_parent.remove(children[child_index])
+                encoded = ET.tostring(candidate, encoding="unicode")
+                if interesting(encoded):
+                    current = candidate
+                    changed = True
+                    break
+                if interesting.runs >= max_runs:
+                    break
+            if changed or interesting.runs >= max_runs:
+                break
+    return ET.tostring(current, encoding="unicode")
+
+
+def minimize_with_repro(
+    root: Path,
+    failing_input: str,
+    repro: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Minimize input while a bounded argv-based reproduction still fails."""
+    argv = repro.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+        return failing_input, {"applied": False, "reason": "repro.argv must be a string array"}
+    max_runs = max(1, min(int(repro.get("max_runs") or 30), 50))
+    timeout = max(1, min(int(repro.get("timeout") or 5), 15))
+    pattern = str(repro.get("failure_pattern") or "")
+
+    with tempfile.TemporaryDirectory(prefix=".cachelayer-repro-", dir=root) as temp:
+        input_path = Path(temp) / "input.txt"
+
+        class Interesting:
+            runs = 0
+            last_output = ""
+
+            def __call__(self, candidate: str) -> bool:
+                if self.runs >= max_runs:
+                    return False
+                self.runs += 1
+                input_path.write_text(candidate, encoding="utf-8")
+                command = [arg.replace("{input}", str(input_path)) for arg in argv]
+                uses_file = any("{input}" in arg for arg in argv)
+                result = run_cmd(
+                    command,
+                    cwd=root,
+                    timeout=timeout,
+                    input_text=None if uses_file else candidate,
+                )
+                self.last_output = result.get("output") or ""
+                failed = result.get("code") not in (0, None)
+                if pattern:
+                    try:
+                        return failed and re.search(pattern, self.last_output) is not None
+                    except re.error:
+                        return False
+                return failed
+
+        interesting = Interesting()
+        if not interesting(failing_input):
+            return failing_input, {
+                "applied": False,
+                "reason": "initial input did not reproduce the requested failure",
+                "runs": interesting.runs,
+                "diagnostic": cap_text(interesting.last_output, 500),
+            }
+        stripped = failing_input.lstrip()
+        if stripped.startswith(("{", "[")):
+            reduced = _hdd_json_repro(failing_input, interesting, max_runs)
+            method = "json-hdd-repro"
+        elif stripped.startswith("<"):
+            reduced = _hdd_xml_repro(failing_input, interesting, max_runs)
+            method = "xml-hdd-repro"
+        else:
+            reduced = ddmin(failing_input, interesting, max_rounds=max_runs)
+            method = "ddmin-repro"
+        return reduced, {
+            "applied": len(reduced) < len(failing_input),
+            "method": method,
+            "oracle": "non-zero exit" + (f" matching /{pattern}/" if pattern else ""),
+            "oracle_verified": True,
+            "runs": interesting.runs,
+            "max_runs": max_runs,
+            "reduction_pct": round(
+                100 * (1 - len(reduced) / max(len(failing_input), 1)),
+                1,
+            ),
+        }
 
 
 def debug_failure(
@@ -407,6 +838,10 @@ def debug_failure(
     file: str | None = None,
     line: int | None = None,
     coverage_matrix: list[dict[str, Any]] | None = None,
+    auto_coverage: bool = True,
+    timeout: int = 45,
+    failing_input: str = "",
+    repro: dict[str, Any] | None = None,
     *,
     cwd: str | None = None,
 ) -> dict[str, Any]:
@@ -420,7 +855,11 @@ def debug_failure(
             "next": "Paste the failing test / traceback. Do not grep first.",
         }
 
-    minimized, minimizer = minimize_failure_blob(blob)
+    minimized, evidence_minimizer = minimize_failure_blob(blob)
+    minimized_input = ""
+    minimizer = evidence_minimizer
+    if failing_input and repro:
+        minimized_input, minimizer = minimize_with_repro(root, failing_input, repro)
 
     frames = flits_rank(parse_frames(minimized or blob))
     crash = None
@@ -448,12 +887,16 @@ def debug_failure(
         js = joern_slice(root, f, ln, None) if lang in ("java", "js", "ts", "tsx", "jsx") else None
         if js and js.get("text"):
             slice_info = js
-            slice_status = {"available": True, "method": "joern-slice", "degraded": False}
+            slice_status = {"available": True, "method": "joern-data-flow", "degraded": False}
         else:
-            sc = scalpel_slice(root, f, ln) if lang in ("py", "python") else None
+            sc = python_backward_slice(root, f, ln) if lang in ("py", "python") else None
             if sc:
                 slice_info = sc
-                slice_status = {"available": True, "method": "scalpel", "degraded": False}
+                slice_status = {
+                    "available": True,
+                    "method": "ast-def-use-backward",
+                    "degraded": False,
+                }
             else:
                 slice_info = python_enclosing_slice(root, f, ln)
                 slice_status = {
@@ -461,13 +904,14 @@ def debug_failure(
                     "method": slice_info.get("method"),
                     "degraded": True,
                     "reason": (
-                        "Scalpel unavailable/unsupported; used stdlib AST."
+                        "Def-use slice unavailable; used enclosing AST."
                         if lang in ("py", "python")
-                        else "Joern unavailable/unsupported; used bounded source window."
+                        else (js or {}).get("reason")
+                        or "Joern unavailable; used bounded source window."
                     ),
                 }
         if lang == "java":
-            java_sbfl = java_fault_localization(root, info)
+            java_sbfl = java_fault_localization(root, info, timeout=timeout)
     if coverage_matrix:
         failed_cov: dict[tuple[str, int], int] = {}
         passed_cov: dict[tuple[str, int], int] = {}
@@ -482,9 +926,21 @@ def debug_failure(
             ochiai_result = {"available": True, "method": "coverage-matrix", "ranked": ochiai(failed_cov, passed_cov)}
     elif info["flags"].get("coverage"):
         ochiai_result = ochiai_from_coverage(root, blob)
+        if (
+            not ochiai_result.get("available")
+            and auto_coverage
+            and info.get("python")
+            and info["tools"].get("python3")
+        ):
+            ochiai_result = generate_python_ochiai(
+                root,
+                blob,
+                info["tools"]["python3"],
+                timeout,
+            )
 
     rubric = {
-        "input": cap_text(minimized, 900),
+        "input": cap_text(minimized_input or minimized, 900),
         "expected": "tests/typecheck pass",
         "actual": cap_text(
             next((ln for ln in reversed((minimized or "").splitlines()) if ln.strip()), ""),
@@ -511,13 +967,24 @@ def debug_failure(
         "ochiai": ochiai_result,
         "java_sbfl": java_sbfl,
         "rubric": rubric,
-        "minimizer": {**minimizer, "original_chars": len(blob), "result_chars": len(minimized or "")},
+        "minimizer": {
+            **minimizer,
+            "original_chars": len(failing_input) if failing_input and repro else len(blob),
+            "result_chars": len(minimized_input) if failing_input and repro else len(minimized or ""),
+        },
+        "minimized_input": cap_text(minimized_input, 3500),
+        "evidence_minimizer": evidence_minimizer,
         "tools_used": {
             "flits": True,
-            "ddmin_or_hdd": bool(minimizer.get("applied")),
-            "joern": bool(slice_info and slice_info.get("method") == "joern-slice"),
+            "ddmin_or_hdd": bool(
+                minimizer.get("applied") and minimizer.get("oracle_verified")
+            ),
+            "joern": bool(slice_info and slice_info.get("method") == "joern-data-flow"),
             "scalpel_available": bool(info["flags"].get("scalpel")),
-            "scalpel_used": bool(slice_info and slice_info.get("method") == "scalpel"),
+            "scalpel_used": False,
+            "python_def_use_slice": bool(
+                slice_info and slice_info.get("method") == "ast-def-use-backward"
+            ),
             "ast_slice": bool(slice_info and slice_info.get("method") == "ast-enclosing"),
             "flacoco_or_gzoltar": bool(java_sbfl.get("executed")),
         },

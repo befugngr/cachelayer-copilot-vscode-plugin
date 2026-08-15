@@ -67,9 +67,10 @@ _DEBUG = {
     "name": "debug_failure",
     "description": (
         "When you have a stack trace or failing test output, call ONCE instead of grepping. "
-        "Returns FLITS-ranked frames, a bounded crash-function slice, optional real Ochiai ranks "
-        "when a failing/passing coverage matrix is supplied, "
-        "minimized input, and a self-debug rubric (input/expected/actual/fix). "
+        "Returns FLITS-ranked frames, a Python def-use/control slice or Joern data-flow slice, "
+        "and real Ochiai ranks from supplied or automatically generated coverage contexts. "
+        "With failing_input + repro argv, reruns a bounded no-shell ddmin/HDD oracle. "
+        "Java projects can use Flacoco from PATH or FLACOCO_JAR. "
         "Do not call on passing tests."
     ),
     "inputSchema": {
@@ -79,6 +80,33 @@ _DEBUG = {
             "test_output": {"type": "string"},
             "file": {"type": "string"},
             "line": {"type": "integer"},
+            "auto_coverage": {
+                "type": "boolean",
+                "default": True,
+                "description": "Rerun only parsed failing pytest files with coverage contexts when needed.",
+            },
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 60, "default": 45},
+            "failing_input": {
+                "type": "string",
+                "description": "Optional input to minimize with a real reproduction command.",
+            },
+            "repro": {
+                "type": "object",
+                "description": "Bounded no-shell failure oracle for ddmin/HDD.",
+                "required": ["argv"],
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Command argv; use {input} for a temporary input file, otherwise input is stdin.",
+                    },
+                    "failure_pattern": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 15, "default": 5},
+                    "max_runs": {"type": "integer", "minimum": 1, "maximum": 50, "default": 30},
+                },
+            },
             "coverage_matrix": {
                 "type": "array",
                 "maxItems": 10000,
@@ -107,13 +135,20 @@ def _tia(changed_files=None, **_kw):
     return run_affected_tests(changed_files=changed_files)
 
 
-def _debug(stack_trace="", test_output="", file=None, line=None, coverage_matrix=None, **_kw):
+def _debug(
+    stack_trace="", test_output="", file=None, line=None, coverage_matrix=None,
+    auto_coverage=True, timeout=45, failing_input="", repro=None, **_kw
+):
     return debug_failure(
         stack_trace=stack_trace or "",
         test_output=test_output or "",
         file=file,
         line=line,
         coverage_matrix=coverage_matrix,
+        auto_coverage=bool(auto_coverage),
+        timeout=max(1, min(int(timeout), 60)),
+        failing_input=failing_input or "",
+        repro=repro,
     )
 
 
