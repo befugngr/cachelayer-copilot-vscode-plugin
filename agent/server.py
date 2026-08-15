@@ -45,8 +45,10 @@ _VERIFY = {
 _TIA = {
     "name": "run_affected_tests",
     "description": (
-        "Run ONLY tests that touch the current change (pytest-testmon, mapped pytest, "
-        "Jest findRelatedTests, Maven -Dtest, Gradle --tests, Ekstazi if configured). "
+        "Run ONLY tests that touch the current change: pytest-testmon or coverage contexts, "
+        "Jest findRelatedTests, Maven Surefire/STARTS/Ekstazi/Smart Test Picker, or Gradle "
+        "--tests/affectedTest/Smart Test Picker. Reports JaCoCo changed-line coverage separately "
+        "from test selection and uses a bounded static Java forward-slice when no dynamic map exists. "
         "Use this instead of the full test suite after edits. Do not poll a long full run."
     ),
     "inputSchema": {

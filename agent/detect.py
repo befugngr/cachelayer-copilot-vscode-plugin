@@ -52,9 +52,12 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
             except Exception:
                 pass
 
+    combined_java_build = (pom_text + "\n" + gradle_text).lower()
+    py_sources = any(root.glob("*.py")) or any(root.glob("src/**/*.py"))
     info = {
         "root": str(root),
-        "python": py or bool(which("pytest") or which("mypy") or which("ruff")),
+        # Global pytest/mypy/ruff installs do not make a Java workspace Python.
+        "python": py or py_sources,
         "javascript": js,
         "typescript": tsconfig or js,
         "java": java,
@@ -84,8 +87,14 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
             "tsconfig": tsconfig,
             "eslint_config": eslint_cfg,
             "testmon": _has_testmon(root),
-            "ekstazi": "ekstazi" in pom_text.lower() or "ekstazi" in gradle_text.lower(),
-            "jacoco": "jacoco" in pom_text.lower() or "jacoco" in gradle_text.lower(),
+            "ekstazi": "ekstazi" in combined_java_build,
+            "jacoco": "jacoco" in combined_java_build,
+            "starts": "starts-maven-plugin" in combined_java_build,
+            "smart_test_picker": "smart-test-picker" in combined_java_build,
+            "affected_tests": (
+                "io.github.vedanthvdev.affectedtests" in combined_java_build
+                or "affectedtest" in combined_java_build
+            ),
             "scalpel": _can_import("scalpel"),
             "coverage": _can_import("coverage"),
         },

@@ -1,6 +1,7 @@
 """Test selection strategies beyond name matching. Stdlib only, bounded, honest about what it used."""
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -22,6 +23,19 @@ _JACOCO_REPORTS = (
     "target/site/jacoco-aggregate/jacoco.xml",
     "build/reports/jacoco/test/jacocoTestReport.xml",
 )
+_SMART_MAPS = (
+    "coverage-map.json",
+    "build/test-coverage-map.json",
+    "target/test-coverage-map.json",
+    "build/smart-test-picker/coverage-map.json",
+    "build/reports/smart-test-picker/coverage-map.json",
+    "target/smart-test-picker/coverage-map.json",
+    "target/reports/smart-test-picker/coverage-map.json",
+)
+_SMART_SELECTIONS = (
+    "build/selected-tests.json",
+    "target/selected-tests.json",
+)
 
 
 def _walk(root: Path, suffixes: tuple[str, ...], limit: int = MAX_SCAN_FILES) -> list[Path]:
@@ -35,6 +49,55 @@ def _walk(root: Path, suffixes: tuple[str, ...], limit: int = MAX_SCAN_FILES) ->
             continue
         found.append(path)
     return found
+
+
+def smart_test_picker_map(root: Path) -> str | None:
+    """Return a configured per-test JaCoCo map without searching build trees unboundedly."""
+    for rel in _SMART_MAPS:
+        path = root / rel
+        if path.is_file():
+            return rel
+    for base_name in ("build", "target"):
+        base = root / base_name
+        if not base.is_dir():
+            continue
+        for path in base.glob("**/*coverage*map*.json"):
+            if path.is_file():
+                return path.relative_to(root).as_posix()
+    return None
+
+
+def smart_test_picker_selection(root: Path) -> dict[str, Any] | None:
+    """Read the selector's explicit output after a Smart Test Picker run."""
+    path = next((root / rel for rel in _SMART_SELECTIONS if (root / rel).is_file()), None)
+    if path is None:
+        candidates: list[Path] = []
+        for build_dir in ("build", "target"):
+            candidates.extend(root.glob(f"**/{build_dir}/selected-tests.json"))
+        path = next((candidate for candidate in candidates[:200] if candidate.is_file()), None)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(**_READ))
+    except (OSError, ValueError):
+        return None
+    selected = payload.get("selectedTests") or []
+    unmapped = payload.get("unmappedTests") or {}
+    tests = list(dict.fromkeys([
+        *[str(item) for item in selected],
+        *[str(item) for item in (unmapped.keys() if isinstance(unmapped, dict) else unmapped)],
+    ]))
+    total_match = re.search(r"\bout of\s+(\d+)\s+total\b", str(payload.get("reason") or ""))
+    total = int(total_match.group(1)) if total_match else None
+    return {
+        "status": payload.get("status"),
+        "reason": payload.get("reason"),
+        "tests": tests[:MAX_TESTS],
+        "selected": len(tests),
+        "total": total,
+        "skipped_estimate": max(0, total - len(tests)) if total is not None else None,
+        "file": path.relative_to(root).as_posix(),
+    }
 
 
 # --- coverage.py dynamic contexts -------------------------------------------------
@@ -220,6 +283,225 @@ def _fq_class(rel: str) -> str:
     return ".".join(parts)
 
 
+def _java_source_info(root: Path) -> dict[str, dict[str, str]]:
+    """Index bounded Java/Kotlin source files by relative path."""
+    result: dict[str, dict[str, str]] = {}
+    for path in _walk(root, (".java", ".kt", ".kts")):
+        rel = path.relative_to(root).as_posix()
+        try:
+            text = path.read_text(**_READ)
+        except OSError:
+            continue
+        result[rel] = {
+            "fq": _fq_class(rel),
+            "simple": path.stem,
+            "text": text,
+            "test": str("/src/test/" in f"/{rel}" or path.stem.endswith(("Test", "Tests", "IT"))),
+        }
+    return result
+
+
+def java_dependents(root: Path, changed_files: list[str], depth: int = 2) -> dict[str, Any]:
+    """Bounded static forward slice: changed classes -> dependents -> test classes.
+
+    Java has reflection and dependency injection, so this is deliberately labelled
+    a static over-approximation. Dynamic selectors take precedence when available.
+    """
+    index = _java_source_info(root)
+    frontier = {
+        rel for rel in changed_files
+        if rel in index and Path(rel).suffix.lower() in (".java", ".kt", ".kts")
+    }
+    if not frontier:
+        return {"tests": [], "dependents": [], "hops": 0}
+    seen = set(frontier)
+    dependents: list[str] = []
+    tests: list[str] = []
+    for _ in range(max(1, min(depth, 4))):
+        targets = [(index[rel]["fq"], index[rel]["simple"]) for rel in frontier]
+        found: set[str] = set()
+        for rel, item in index.items():
+            if rel in seen:
+                continue
+            text = item["text"]
+            matched = False
+            for fq, simple in targets:
+                if not simple or simple not in text:
+                    continue
+                if (
+                    (fq and re.search(rf"^\s*import\s+{re.escape(fq)}\s*;?", text, re.MULTILINE))
+                    or re.search(rf"\b{re.escape(simple)}\b", text)
+                ):
+                    matched = True
+                    break
+            if matched:
+                found.add(rel)
+        if not found:
+            break
+        for rel in sorted(found):
+            if index[rel]["test"] == "True":
+                fq = index[rel]["fq"]
+                if fq and fq not in tests:
+                    tests.append(fq)
+            elif rel not in dependents:
+                dependents.append(rel)
+        seen |= found
+        frontier = found
+    return {
+        "tests": tests[:40],
+        "dependents": dependents[:100],
+        "hops": min(depth, 4),
+    }
+
+
+def java_test_report_snapshot(root: Path) -> dict[str, int]:
+    """Snapshot JUnit XML report mtimes before a dynamic selector runs."""
+    result: dict[str, int] = {}
+    for pattern in (
+        "**/target/surefire-reports/TEST-*.xml",
+        "**/target/failsafe-reports/TEST-*.xml",
+        "**/build/test-results/**/TEST-*.xml",
+    ):
+        for path in root.glob(pattern):
+            try:
+                result[str(path)] = path.stat().st_mtime_ns
+            except OSError:
+                pass
+    return result
+
+
+def fresh_java_test_reports(root: Path, before: dict[str, int]) -> dict[str, Any]:
+    """Count test classes from JUnit XML reports created or changed by one run."""
+    suites: list[str] = []
+    methods = failures = skipped = 0
+    report_files: list[str] = []
+    for pattern in (
+        "**/target/surefire-reports/TEST-*.xml",
+        "**/target/failsafe-reports/TEST-*.xml",
+        "**/build/test-results/**/TEST-*.xml",
+    ):
+        for path in root.glob(pattern):
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            if before.get(str(path)) == mtime:
+                continue
+            try:
+                element = ET.parse(path).getroot()
+            except (ET.ParseError, OSError):
+                continue
+            name = element.get("name") or path.stem.removeprefix("TEST-")
+            if name not in suites:
+                suites.append(name)
+            methods += int(element.get("tests") or 0)
+            failures += int(element.get("failures") or 0) + int(element.get("errors") or 0)
+            skipped += int(element.get("skipped") or 0)
+            report_files.append(path.relative_to(root).as_posix())
+    return {
+        "tests": suites[:MAX_TESTS],
+        "selected": len(suites),
+        "test_methods": methods,
+        "failures": failures,
+        "skipped_methods": skipped,
+        "reports": report_files[:100],
+    }
+
+
+_DIFF_HUNK_RE = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@")
+
+
+def changed_line_numbers(diff_text: str, changed_files: list[str]) -> dict[str, set[int]]:
+    """Parse added/modified line numbers from a zero-context unified diff."""
+    wanted = {p.replace("\\", "/") for p in changed_files}
+    result: dict[str, set[int]] = {p: set() for p in wanted}
+    current: str | None = None
+    line_no: int | None = None
+    for raw in (diff_text or "").splitlines():
+        if raw.startswith("+++ b/"):
+            candidate = raw[6:].strip().replace("\\", "/")
+            current = candidate if candidate in wanted else None
+            line_no = None
+            continue
+        match = _DIFF_HUNK_RE.match(raw)
+        if match:
+            line_no = int(match.group(1))
+            continue
+        if current is None or line_no is None:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            result[current].add(line_no)
+            line_no += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            continue
+        elif raw.startswith(" "):
+            line_no += 1
+    return result
+
+
+def jacoco_diff_coverage(
+    root: Path, changed_files: list[str], diff_text: str
+) -> dict[str, Any]:
+    """Measure JaCoCo coverage of changed Java lines; this does not select tests."""
+    report = _jacoco_report(root)
+    if report is None:
+        return {"available": False, "reason": "no JaCoCo XML report"}
+    try:
+        tree = ET.parse(report)
+    except (ET.ParseError, OSError) as exc:
+        return {"available": False, "reason": f"unreadable JaCoCo report: {exc}"}
+    changed = changed_line_numbers(diff_text, changed_files)
+    if not any(changed.values()):
+        return {
+            "available": True,
+            "report": report.relative_to(root).as_posix(),
+            "changed_lines": 0,
+            "covered_lines": 0,
+            "coverage_percent": None,
+            "uncovered_lines": [],
+        }
+    coverage: dict[str, dict[int, bool]] = {}
+    for package in tree.iter("package"):
+        package_name = (package.get("name") or "").strip("/")
+        for source in package.findall("sourcefile"):
+            name = source.get("name") or ""
+            rel = f"src/main/java/{package_name}/{name}".replace("//", "/")
+            lines: dict[int, bool] = {}
+            for line in source.findall("line"):
+                nr = int(line.get("nr") or 0)
+                covered = int(line.get("ci") or 0) > 0 or int(line.get("cb") or 0) > 0
+                lines[nr] = covered
+            coverage[rel] = lines
+    total = 0
+    covered_count = 0
+    uncovered: list[str] = []
+    unknown: list[str] = []
+    for rel, numbers in changed.items():
+        line_map = coverage.get(rel)
+        if line_map is None:
+            matches = [v for k, v in coverage.items() if rel.endswith(k) or k.endswith(rel)]
+            line_map = matches[0] if len(matches) == 1 else None
+        for number in sorted(numbers):
+            if line_map is None or number not in line_map:
+                unknown.append(f"{rel}:{number}")
+                continue
+            total += 1
+            if line_map[number]:
+                covered_count += 1
+            else:
+                uncovered.append(f"{rel}:{number}")
+    return {
+        "available": True,
+        "report": report.relative_to(root).as_posix(),
+        "changed_lines": total,
+        "covered_lines": covered_count,
+        "coverage_percent": round(100.0 * covered_count / total, 1) if total else None,
+        "uncovered_lines": uncovered[:100],
+        "unknown_lines": unknown[:100],
+        "purpose": "coverage validation, not test selection",
+    }
+
+
 def java_tests_referencing(root: Path, changed_files: list[str], covered: set[str]) -> dict[str, Any]:
     """Select test classes that reference a changed class the suite already covers.
 
@@ -237,6 +519,7 @@ def java_tests_referencing(root: Path, changed_files: list[str], covered: set[st
         return {"tests": [], "uncovered": [], "changed_classes": []}
 
     uncovered = [fq for fq in changed_classes if fq not in covered]
+    eligible = {fq: simple for fq, simple in changed_classes.items() if fq in covered}
     test_roots = [root / "src" / "test" / "java", root / "src" / "test" / "kotlin"]
     tests: list[str] = []
     for base in test_roots:
@@ -247,7 +530,7 @@ def java_tests_referencing(root: Path, changed_files: list[str], covered: set[st
                 text = path.read_text(**_READ)
             except OSError:
                 continue
-            for fq, simple in changed_classes.items():
+            for fq, simple in eligible.items():
                 if fq in text or re.search(rf"\b{re.escape(simple)}\b", text):
                     if path.stem not in tests:
                         tests.append(path.stem)
