@@ -16,7 +16,7 @@
       },
       {
         "type": "command",
-        "matcher": "Edit|Write|create|edit|apply_patch|str_replace_editor|create_file|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
+        "matcher": "Edit|Write|ApplyPatch|MultiEdit|NotebookEdit|create|edit|apply_patch|create_file|edit_file|write_file|patch_file|str_replace_editor|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
         "command": "bash -c 'for d in \"$CLAUDE_PLUGIN_ROOT\" \"$PLUGIN_ROOT\" .; do [ -n \"$d\" ] && [ -f \"$d/agent/run_critic.sh\" ] && exec bash \"$d/agent/run_critic.sh\"; done; printf \"{}\\n\"'",
         "timeout": 15
       }

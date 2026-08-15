@@ -17,6 +17,7 @@ HOOK_MAX_CHARS = 1800
 DEFAULT_TIMEOUT_S = 20
 HOOK_TIMEOUT_S = 6
 MAX_CAPTURE_BYTES = 256_000
+DEFAULT_MEMORY_MB = 768
 
 CODE_EXTS = {
     ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
@@ -108,6 +109,7 @@ def run_cmd(
     timeout: int = DEFAULT_TIMEOUT_S,
     env: dict[str, str] | None = None,
     input_text: str | None = None,
+    memory_mb: int | None = DEFAULT_MEMORY_MB,
 ) -> dict[str, Any]:
     if not argv or not argv[0]:
         return {"ok": False, "code": 127, "output": "empty command", "argv": argv, "available": False}
@@ -129,6 +131,7 @@ def run_cmd(
                 creationflags=creationflags,
                 **popen_kwargs,
             )
+            memory_limited = _limit_process_memory(proc, memory_mb)
             try:
                 proc.communicate(
                     input=input_text.encode("utf-8") if input_text is not None else None,
@@ -143,6 +146,7 @@ def run_cmd(
                     "output": f"timeout after {timeout}s: {format_argv(argv[:4])}",
                     "argv": argv,
                     "timeout": True,
+                    "memory_limited": memory_limited,
                 }
             output.seek(0, os.SEEK_END)
             size = output.tell()
@@ -163,6 +167,7 @@ def run_cmd(
             "output": out,
             "argv": argv,
             "truncated": truncated,
+            "memory_limited": memory_limited,
         }
     except (FileNotFoundError, PermissionError) as exc:
         return {
@@ -174,6 +179,21 @@ def run_cmd(
         }
     except OSError as exc:
         return {"ok": False, "code": 126, "output": f"command failed to start: {exc}", "argv": argv}
+
+
+def _limit_process_memory(proc: subprocess.Popen[bytes], memory_mb: int | None) -> bool:
+    """Apply a small per-process address-space cap where the OS supports prlimit."""
+    if os.name == "nt" or memory_mb is None:
+        return False
+    try:
+        import resource
+
+        limit_mb = max(256, min(int(memory_mb), 1536))
+        limit = limit_mb * 1024 * 1024
+        resource.prlimit(proc.pid, resource.RLIMIT_AS, (limit, limit))
+        return True
+    except (AttributeError, ImportError, OSError, PermissionError, ProcessLookupError, ValueError):
+        return False
 
 
 def _terminate_process(proc: subprocess.Popen[bytes]) -> None:

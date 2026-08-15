@@ -12,7 +12,8 @@ try:
     from .tia_select import (
         coverage_context_tests, jacoco_covered_classes, jacoco_diff_coverage,
         fresh_java_test_reports, java_dependents, java_test_report_snapshot,
-        java_tests_referencing, python_importers, smart_test_picker_map,
+        jacoco_per_test_selection, joern_slice_selection, native_rts_selection,
+        python_importers, rts_seed_plan, smart_test_picker_map,
         smart_test_picker_selection,
     )
     from .util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
@@ -21,7 +22,8 @@ except ImportError:
     from tia_select import (
         coverage_context_tests, jacoco_covered_classes, jacoco_diff_coverage,
         fresh_java_test_reports, java_dependents, java_test_report_snapshot,
-        java_tests_referencing, python_importers, smart_test_picker_map,
+        jacoco_per_test_selection, joern_slice_selection, native_rts_selection,
+        python_importers, rts_seed_plan, smart_test_picker_map,
         smart_test_picker_selection,
     )
     from util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
@@ -243,15 +245,22 @@ def _java_test_classes(root: Path, files: list[str]) -> list[str]:
     return list(dict.fromkeys(tests))[:40]
 
 
-def _java_static_selection(root: Path, files: list[str]) -> tuple[list[str], list[str]]:
+def _java_static_selection(
+    root: Path, files: list[str], info: dict[str, Any]
+) -> tuple[list[str], list[str], dict[str, Any]]:
     tests = _java_test_classes(root, files)
     sources = ["name-map"] if tests else []
     graph = java_dependents(root, files, depth=3)
     extra = [test for test in graph.get("tests") or [] if test not in tests]
     if extra:
         tests.extend(extra)
-        sources.append("java-static-forward-slice")
-    return tests[:40], sources
+        sources.append("java-bounded-type-import-forward-slice")
+    joern = joern_slice_selection(root, files, info.get("tools", {}).get("joern-slice"))
+    joern_tests = [test for test in joern.get("tests") or [] if test not in tests]
+    if joern_tests:
+        tests.extend(joern_tests)
+        sources.append("joern-usage-call-slice")
+    return tests[:40], sources, joern
 
 
 def _git_diff_for_files(root: Path, files: list[str]) -> str:
@@ -271,12 +280,26 @@ def _git_diff_for_files(root: Path, files: list[str]) -> str:
 
 def _java_metadata(root: Path, info: dict[str, Any], files: list[str]) -> dict[str, Any]:
     jacoco = _jacoco_expansion(root, info, files)
+    per_test = jacoco_per_test_selection(root, files)
     diff_coverage = (
         jacoco_diff_coverage(root, files, _git_diff_for_files(root, files))
         if info["flags"].get("jacoco")
         else {"available": False, "reason": "JaCoCo not configured"}
     )
-    return {"jacoco": jacoco, "diff_coverage": diff_coverage}
+    scalpel_available = bool(info.get("flags", {}).get("scalpel"))
+    return {
+        "jacoco": jacoco,
+        "jacoco_per_test": per_test,
+        "diff_coverage": diff_coverage,
+        "scalpel": {
+            "available": scalpel_available,
+            "used": False,
+            "reason": (
+                "installed Scalpel exposes no verified Java test-impact call/dependency API"
+                if scalpel_available else "Scalpel not available"
+            ),
+        },
+    }
 
 
 def _java_result(
@@ -310,9 +333,18 @@ def _java_result(
         "jacoco_detected": bool(jacoco.get("configured")),
         "jacoco_report_parsed": jacoco["parsed"],
         "jacoco_report": jacoco.get("report"),
-        "jacoco_used_for_selection": bool(jacoco.get("tests")),
+        "jacoco_used_for_selection": any(
+            source in ("jacoco-native-per-test-map", "smart-picker-per-test-jacoco-map")
+            for source in sources
+        ),
+        "jacoco_selection_mode": (
+            "per-test-map"
+            if any(source in ("jacoco-native-per-test-map", "smart-picker-per-test-jacoco-map") for source in sources)
+            else "aggregate-validation-only" if jacoco.get("parsed") else "not-available"
+        ),
         "uncovered_changed_classes": jacoco["uncovered"],
         "jacoco_diff_coverage": metadata["diff_coverage"],
+        "scalpel": metadata["scalpel"],
     }
 
 
@@ -326,6 +358,7 @@ def _run_dynamic_java(
     inventory_count: int,
     metadata: dict[str, Any],
     smart_picker: bool = False,
+    native_kind: str | None = None,
 ) -> dict[str, Any]:
     before = java_test_report_snapshot(root)
     result = run_cmd(argv, cwd=root, timeout=timeout)
@@ -349,11 +382,19 @@ def _run_dynamic_java(
             payload["selector_status"] = selection["status"]
             payload["selector_reason"] = selection["reason"]
             payload["selector_fell_back_full_suite"] = selection["status"] == "FULL_SUITE"
+    if native_kind:
+        native = native_rts_selection(root, native_kind, inventory_count)
+        payload["native_selection"] = native
+        if native.get("selected") is not None:
+            payload["tests"] = native["tests"]
+            payload["selected"] = native["selected"]
+            payload["skipped_estimate"] = native["skipped_estimate"]
+            payload["selection_count_source"] = native["source"]
     return payload
 
 
 def _jacoco_expansion(root: Path, info: dict[str, Any], files: list[str]) -> dict[str, Any]:
-    """Gate a static test-reference expansion with aggregate JaCoCo class coverage."""
+    """Read aggregate JaCoCo strictly as validation metadata."""
     if not info["flags"].get("jacoco"):
         return {
             "tests": [], "parsed": False, "uncovered": [], "report": None,
@@ -365,13 +406,25 @@ def _jacoco_expansion(root: Path, info: dict[str, Any], files: list[str]) -> dic
             "tests": [], "parsed": False, "uncovered": [], "report": None,
             "configured": True, "reason": report.get("reason"),
         }
-    refs = java_tests_referencing(root, files, report.get("covered") or set())
+    changed: list[str] = []
+    for rel in files:
+        path = Path(rel)
+        if path.suffix.lower() not in (".java", ".kt", ".kts"):
+            continue
+        parts = list(path.with_suffix("").parts)
+        for marker in ("java", "kotlin"):
+            if marker in parts:
+                parts = parts[parts.index(marker) + 1:]
+                break
+        changed.append(".".join(parts))
+    covered = report.get("covered") or set()
     return {
-        "tests": refs["tests"],
+        "tests": [],
         "parsed": True,
-        "uncovered": refs["uncovered"],
+        "uncovered": [name for name in changed if name and name not in covered],
         "report": report.get("report"),
         "configured": True,
+        "purpose": "aggregate coverage validation, not per-test selection",
     }
 
 
@@ -380,15 +433,20 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     if not mvn:
         return {"ok": False, "available": False, "runner": "maven", "install": "Install Maven or add mvnw/mvnw.cmd."}
     inventory = _java_test_inventory(root)
-    tests, sources = _java_static_selection(root, files)
+    tests, sources, joern = _java_static_selection(root, files, info)
     metadata = _java_metadata(root, info, files)
     jacoco = metadata["jacoco"]
-    extra = [t for t in jacoco["tests"] if t not in tests]
-    if extra:
-        tests.extend(extra)
-        sources.append("jacoco-coverage-gated-static")
     picker_map = smart_test_picker_map(root)
     if info["flags"].get("smart_test_picker") and picker_map:
+        prior = smart_test_picker_selection(root)
+        if prior and prior.get("status") == "FULL_SUITE":
+            return {
+                "ok": False, "available": True, "runner": "maven-smart-test-picker",
+                "selected": 0, "tests": [], "skipped_estimate": len(inventory),
+                "selection_sources": ["smart-picker-per-test-jacoco-map"],
+                "summary": "Refused Smart Test Picker because its selector status is FULL_SUITE.",
+                "full_suite_refused": True, "selection": prior,
+            }
         payload = _run_dynamic_java(
             root,
             [
@@ -396,7 +454,7 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
                 "com.sap.oss.smart-test-picker:smart-test-picker-maven:0.1.0:smart-test",
             ],
             timeout,
-            runner="maven-smart-test-picker", sources=["jacoco-per-test-map"],
+            runner="maven-smart-test-picker", sources=["smart-picker-per-test-jacoco-map"],
             inventory_count=len(inventory), metadata=metadata, smart_picker=True,
         )
         payload["coverage_map"] = picker_map
@@ -408,7 +466,7 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
             [mvn, "-q", "-DfailIfNoTests=false", "starts:starts"],
             timeout,
             runner="maven-starts", sources=["starts-static-rts"],
-            inventory_count=len(inventory), metadata=metadata,
+            inventory_count=len(inventory), metadata=metadata, native_kind="starts",
         )
     ekstazi_db = any(root.glob("**/.ekstazi"))
     if info["flags"].get("ekstazi") and ekstazi_db:
@@ -417,8 +475,28 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
             [mvn, "-q", "-DfailIfNoTests=false", "test"],
             timeout,
             runner="maven-ekstazi", sources=["ekstazi-dependency-rts"],
-            inventory_count=len(inventory), metadata=metadata,
+            inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
         )
+    native_jacoco = metadata["jacoco_per_test"]
+    if native_jacoco.get("available") and native_jacoco.get("tests"):
+        mapped = native_jacoco["tests"][:40]
+        result = run_cmd(
+            [
+                mvn, "-q", "-DfailIfNoTests=false",
+                "-Dsurefire.failIfNoSpecifiedTests=false",
+                f"-Dtest={','.join(mapped)}", "test",
+            ],
+            cwd=root,
+            timeout=timeout,
+        )
+        payload = _java_result(
+            result, runner="maven-surefire-subset", tests=mapped,
+            sources=["jacoco-native-per-test-map"], inventory_count=len(inventory),
+            metadata=metadata,
+        )
+        payload["coverage_map"] = native_jacoco
+        payload["joern"] = joern
+        return payload
     if tests:
         result = run_cmd(
             [
@@ -429,10 +507,12 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
             cwd=root,
             timeout=timeout,
         )
-        return _java_result(
+        payload = _java_result(
             result, runner="maven-surefire-subset", tests=tests,
             sources=sources, inventory_count=len(inventory), metadata=metadata,
         )
+        payload["joern"] = joern
+        return payload
     return {
         "ok": True, "available": True, "runner": "maven-surefire-subset",
         "selected": 0, "skipped_estimate": len(inventory), "tests": [],
@@ -440,11 +520,16 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
         "jacoco_detected": bool(info["flags"].get("jacoco")),
         "jacoco_report_parsed": jacoco["parsed"],
         "jacoco_used_for_selection": False,
+        "jacoco_selection_mode": "aggregate-validation-only" if jacoco["parsed"] else "not-available",
         "uncovered_changed_classes": jacoco["uncovered"],
         "jacoco_diff_coverage": metadata["diff_coverage"],
+        "scalpel": metadata["scalpel"],
         "ekstazi_detected": bool(info["flags"].get("ekstazi")),
         "smart_test_picker_detected": bool(info["flags"].get("smart_test_picker")),
         "starts_detected": bool(info["flags"].get("starts")),
+        "joern": joern,
+        "jacoco_per_test": metadata["jacoco_per_test"],
+        "rts_seed": rts_seed_plan(root, info),
         "install": (
             "Seed configured RTS once (Smart Test Picker/Ekstazi/STARTS), "
             "or keep the bounded static fallback."
@@ -452,59 +537,144 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     }
 
 
+_FULL_SUITE_RE = re.compile(
+    r"\b(?:FULL_SUITE|ALL_TESTS)\b"
+    r"|full[_ -]?suite\s*(?:fallback|mode|status)?\s*[:=]\s*(?:true|yes|enabled)"
+    r"|fall(?:ing)?\s+back\s+to\s+(?:the\s+)?full\s+(?:test\s+)?suite",
+    re.IGNORECASE,
+)
+
+
+def _affected_test_inspection(root: Path, gradle: str, timeout: int) -> dict[str, Any]:
+    for build_name in ("build.gradle", "build.gradle.kts"):
+        path = root / build_name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if _FULL_SUITE_RE.search(text):
+            return {
+                "safe": False, "reason": f"{build_name} enables or advertises full-suite fallback",
+                "output": "",
+            }
+    inspection = run_cmd(
+        [gradle, "-q", "affectedTest", "--explain"],
+        cwd=root,
+        timeout=min(timeout, 30),
+    )
+    output = inspection.get("output") or ""
+    if _FULL_SUITE_RE.search(output):
+        return {"safe": False, "reason": "affectedTest --explain reported FULL_SUITE", "output": output}
+    if not inspection.get("ok"):
+        return {
+            "safe": False,
+            "reason": "affectedTest safety inspection failed; execution was not attempted",
+            "output": output,
+        }
+    return {"safe": True, "reason": "affectedTest --explain showed no full-suite escalation", "output": output}
+
+
 def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int) -> dict[str, Any]:
     gradle = info["tools"].get("gradle")
     if not gradle:
         return {"ok": False, "available": False, "runner": "gradle", "install": "Install Gradle or add gradlew/gradlew.bat."}
     inventory = _java_test_inventory(root)
-    tests, sources = _java_static_selection(root, files)
+    tests, sources, joern = _java_static_selection(root, files, info)
     metadata = _java_metadata(root, info, files)
     jacoco = metadata["jacoco"]
-    extra = [t for t in jacoco["tests"] if t not in tests]
-    if extra:
-        tests.extend(extra)
-        sources.append("jacoco-coverage-gated-static")
     picker_map = smart_test_picker_map(root)
     if info["flags"].get("smart_test_picker") and picker_map:
+        prior = smart_test_picker_selection(root)
+        if prior and prior.get("status") == "FULL_SUITE":
+            return {
+                "ok": False, "available": True, "runner": "gradle-smart-test-picker",
+                "selected": 0, "tests": [], "skipped_estimate": len(inventory),
+                "selection_sources": ["smart-picker-per-test-jacoco-map"],
+                "summary": "Refused Smart Test Picker because its selector status is FULL_SUITE.",
+                "full_suite_refused": True, "selection": prior,
+            }
         payload = _run_dynamic_java(
             root,
             [gradle, "-q", "selectTests", "smartTest"],
             timeout,
-            runner="gradle-smart-test-picker", sources=["jacoco-per-test-map"],
+            runner="gradle-smart-test-picker", sources=["smart-picker-per-test-jacoco-map"],
             inventory_count=len(inventory), metadata=metadata, smart_picker=True,
         )
         payload["coverage_map"] = picker_map
         return payload
+    if info["flags"].get("starts") and any(root.glob("**/.starts")):
+        return _run_dynamic_java(
+            root, [gradle, "-q", "starts"], timeout,
+            runner="gradle-starts", sources=["starts-static-rts"],
+            inventory_count=len(inventory), metadata=metadata, native_kind="starts",
+        )
+    if info["flags"].get("ekstazi") and any(root.glob("**/.ekstazi")):
+        return _run_dynamic_java(
+            root, [gradle, "-q", "test"], timeout,
+            runner="gradle-ekstazi", sources=["ekstazi-dependency-rts"],
+            inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
+        )
     if info["flags"].get("affected_tests"):
+        inspection = _affected_test_inspection(root, gradle, timeout)
+        if not inspection["safe"]:
+            return {
+                "ok": False, "available": True, "runner": "gradle-affected-test",
+                "selected": 0, "tests": [], "skipped_estimate": len(inventory),
+                "selection_sources": ["gradle-affected-tests"],
+                "summary": f"Refused affectedTest: {inspection['reason']}.",
+                "full_suite_refused": True,
+                "inspection": inspection,
+                "install": "Configure affectedTest with full-suite fallback disabled and make --explain succeed.",
+            }
         payload = _run_dynamic_java(
             root, [gradle, "-q", "affectedTest"], timeout,
             runner="gradle-affected-test", sources=["gradle-affected-tests"],
             inventory_count=len(inventory), metadata=metadata,
         )
-        payload["selector_may_fallback_full_suite"] = True
+        payload["inspection"] = inspection
         return payload
-    if info["flags"].get("ekstazi") and any(root.glob("**/.ekstazi")):
-        return _run_dynamic_java(
-            root, [gradle, "-q", "test"], timeout,
-            runner="gradle-ekstazi", sources=["ekstazi-dependency-rts"],
-            inventory_count=len(inventory), metadata=metadata,
+    native_jacoco = metadata["jacoco_per_test"]
+    if native_jacoco.get("available") and native_jacoco.get("tests"):
+        mapped = native_jacoco["tests"][:40]
+        args = [gradle, "-q", "test"]
+        for test in mapped:
+            args.extend(["--tests", test])
+        result = run_cmd(args, cwd=root, timeout=timeout)
+        payload = _java_result(
+            result, runner="gradle-tests-subset", tests=mapped,
+            sources=["jacoco-native-per-test-map"], inventory_count=len(inventory),
+            metadata=metadata,
         )
+        payload["coverage_map"] = native_jacoco
+        payload["joern"] = joern
+        return payload
     if not tests:
         return {
             "ok": True, "available": True, "runner": "gradle-tests-subset", "selected": 0,
             "skipped_estimate": len(inventory), "tests": [], "selection_sources": [],
             "summary": "No safely mapped Java tests; full suite was not run.",
             "jacoco_detected": bool(info["flags"].get("jacoco")),
+            "jacoco_report_parsed": jacoco["parsed"],
+            "jacoco_used_for_selection": False,
+            "jacoco_selection_mode": "aggregate-validation-only" if jacoco["parsed"] else "not-available",
             "jacoco_diff_coverage": metadata["diff_coverage"],
+            "scalpel": metadata["scalpel"],
+            "jacoco_per_test": metadata["jacoco_per_test"],
+            "joern": joern,
+            "rts_seed": rts_seed_plan(root, info),
         }
     args = [gradle, "-q", "test"]
     for test in tests:
         args.extend(["--tests", test])
     result = run_cmd(args, cwd=root, timeout=timeout)
-    return _java_result(
+    payload = _java_result(
         result, runner="gradle-tests-subset", tests=tests,
         sources=sources, inventory_count=len(inventory), metadata=metadata,
     )
+    payload["joern"] = joern
+    return payload
 
 
 def run_affected_tests(
@@ -512,11 +682,26 @@ def run_affected_tests(
     *,
     cwd: str | None = None,
     timeout: int = 45,
+    seed_rts: bool = False,
 ) -> dict[str, Any]:
     info = detect(cwd)
     root = Path(info["root"])
     files = _changed(root, changed_files)
     timeout = max(1, min(int(timeout), 300))
+    seed_requested = seed_rts or os.environ.get("CACHELAYER_TIA_SEED_RTS", "").lower() in {
+        "1", "true", "yes", "plan",
+    }
+    if seed_requested:
+        if not info.get("java"):
+            return {
+                "ok": False, "available": False, "changed_files": files[:30],
+                "summary": "RTS seed planning applies only to Maven/Gradle Java projects.",
+            }
+        plan = rts_seed_plan(root, info)
+        return {
+            "ok": True, "available": True, "runner": "rts-seed-plan",
+            "seed_executed": False, "changed_files": files[:30], **plan,
+        }
 
     if info["python"]:
         python = info["tools"].get("python3")
@@ -548,6 +733,8 @@ def run_affected_tests(
             "install": "Python: pytest-testmon; JS/TS: Jest; Java: Maven Surefire/Ekstazi or Gradle.",
         }
     result["changed_files"] = files[:30]
+    if info.get("java"):
+        result.setdefault("rts_seed", rts_seed_plan(root, info))
     return result
 
 

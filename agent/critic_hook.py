@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Cheap post-edit CRITIC for Cursor/Claude/Codex/Copilot hooks. Lint the edited file only. Fail-open."""
+"""Fail-open CRITIC hook: fast per-file by default, explicit coherent full gate."""
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -17,20 +18,29 @@ from util import is_code_path
 
 EMPTY = "{}"
 
-# VS Code ignores hook matchers and runs every hook on every tool, so gate here too.
-_EDIT_HINTS = ("edit", "write", "patch", "replace", "create")
-_NEVER = ("todo", "plan", "search", "fetch", "read", "grep", "glob")
+# VS Code can ignore matchers, so aliases and deny-lists are enforced here.
+_EDIT_ALIASES = {
+    "applypatch", "apply_patch", "edit", "editfile", "edit_file", "write",
+    "writefile", "write_file", "multiedit", "multi_edit", "notebookedit",
+    "notebook_edit", "create", "createfile", "create_file", "str_replace_editor",
+    "replace_string_in_file", "insert_edit_into_file",
+    "multi_replace_string_in_file", "patch_file",
+}
+_NEVER = ("todo", "plan", "search", "fetch", "read", "grep", "glob", "view", "list", "mcp", "shell", "bash")
+_HOOK_STATE = ".cachelayer/critic-hook-state.json"
+_DEDUP_SECONDS = 30
 
 _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update)\s+File:\s*(.+?)\s*$", re.MULTILINE)
 
 
 def _is_edit_tool(name: str) -> bool:
-    n = name.strip().lower()
-    if not n or n.startswith("mcp"):
+    n = name.strip().lower().replace("-", "_")
+    compact = n.replace("_", "")
+    if not n:
         return False
     if any(bad in n for bad in _NEVER):
         return False
-    return any(hint in n for hint in _EDIT_HINTS)
+    return n in _EDIT_ALIASES or compact in _EDIT_ALIASES
 
 
 def _tool_input(payload: dict) -> dict | str:
@@ -39,6 +49,44 @@ def _tool_input(payload: dict) -> dict | str:
         if isinstance(v, (dict, str)):
             return v
     return {}
+
+
+def normalize_payload(payload: dict) -> dict:
+    """Normalize Cursor, Claude, Codex, Copilot CLI, and VS Code hook shapes."""
+    nested = payload.get("tool") if isinstance(payload.get("tool"), dict) else {}
+    name = (
+        payload.get("tool_name") or payload.get("toolName")
+        or nested.get("name") or payload.get("name") or ""
+    )
+    inp = _tool_input(payload)
+    if not inp and nested:
+        inp = nested.get("input") or nested.get("arguments") or {}
+    cwd = payload.get("cwd") or payload.get("workspaceRoot") or payload.get("workspace_root")
+    if not isinstance(cwd, str):
+        roots = payload.get("workspace_roots")
+        cwd = roots[0] if isinstance(roots, list) and roots and isinstance(roots[0], str) else None
+    cycle = next((
+        payload.get(key) for key in (
+            "edit_cycle_id", "editCycleId", "generation_id", "turn_id",
+            "turnId",
+        ) if isinstance(payload.get(key), str) and payload.get(key)
+    ), "")
+    event = next((
+        payload.get(key) for key in (
+            "tool_call_id", "toolCallId", "call_id", "callId",
+            "invocation_id", "invocationId", "event_id",
+        ) if isinstance(payload.get(key), str) and payload.get(key)
+    ), "")
+    mode = payload.get("critic_mode") or payload.get("criticMode")
+    full_gate = mode == "coherent" or payload.get("full_gate") is True or payload.get("fullGate") is True
+    return {
+        "tool_name": name if isinstance(name, str) else "",
+        "tool_input": inp,
+        "cwd": cwd,
+        "cycle_id": cycle,
+        "event_id": event,
+        "full_gate": full_gate,
+    }
 
 
 def _paths_from_patch(text: str) -> list[str]:
@@ -86,6 +134,32 @@ def _extract_paths(payload: dict) -> list[str]:
     return out
 
 
+def _deduplicated(root: Path, normalized: dict, paths: list[str]) -> bool:
+    identity = normalized["event_id"] or json.dumps({
+        "tool": normalized["tool_name"].lower(),
+        "paths": paths,
+        "cycle": normalized["cycle_id"],
+        "input": normalized["tool_input"],
+    }, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    path = root / _HOOK_STATE
+    now = int(__import__("time").time())
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+        if prior.get("digest") == digest and now - int(prior.get("at", 0)) <= _DEDUP_SECONDS:
+            return True
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"digest": digest, "at": now}), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        pass
+    return False
+
+
 def _line_range(payload: dict) -> list[int] | None:
     inp = _tool_input(payload)
     if not isinstance(inp, dict):
@@ -126,24 +200,34 @@ def main() -> None:
         print(EMPTY)
         return
 
-    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
-    if isinstance(tool_name, str) and tool_name and not _is_edit_tool(tool_name):
+    normalized = normalize_payload(payload)
+    tool_name = normalized["tool_name"]
+    # Unknown tool names remain compatible with older Cursor payloads only
+    # when a concrete code path is present. Named tools must be allowlisted.
+    if tool_name and not _is_edit_tool(tool_name):
         print(EMPTY)
         return
 
-    paths = _extract_paths(payload)
+    normalized_payload = {**payload, "tool_input": normalized["tool_input"]}
+    paths = _extract_paths(normalized_payload)
     if not paths:
         print(EMPTY)
         return
 
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    cwd = normalized["cwd"]
+    root = Path(cwd or os.getcwd()).resolve()
+    if _deduplicated(root, normalized, paths):
+        print(EMPTY)
+        return
     try:
         result = verify_edit(
             paths=paths,
-            line_range=_line_range(payload) if len(paths) == 1 else None,
-            run_tests=False,
+            line_range=_line_range(normalized_payload) if len(paths) == 1 else None,
+            run_tests=bool(normalized["full_gate"]),
             hook=True,
             cwd=cwd,
+            mode="coherent" if normalized["full_gate"] else "fast",
+            edit_cycle_id=normalized["cycle_id"] or None,
         )
     except Exception:
         print(EMPTY)
@@ -163,9 +247,15 @@ def main() -> None:
         print(EMPTY)
         return
 
+    feedback = result.get("feedback") or {}
+    corrective = feedback.get("instruction") or "Make one coherent corrective edit."
     _emit(
-        "CRITIC (local, no extra LLM call): type/lint errors in the file you just edited. "
-        "Fix these before more edits or tests.\n\n" + "\n\n".join(bits),
+        "CRITIC (local, no extra LLM call): checks found errors after your edit. "
+        "The hook did not modify code.\n\n" + "\n\n".join(bits)
+        + f"\n\nCorrective protocol: {corrective}"
+        + f"\ncycle_id={feedback.get('cycle_id', '')} "
+        + f"attempt={feedback.get('attempt', 0)}/{feedback.get('max_retries', 0)} "
+        + f"next_action={feedback.get('action', 'stop_and_report')}",
         payload,
     )
 

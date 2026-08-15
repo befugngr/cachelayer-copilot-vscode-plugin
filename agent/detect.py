@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .util import which, workspace_root
+    from .util import SKIP_PARTS, which, workspace_root
 except ImportError:
-    from util import which, workspace_root
+    from util import SKIP_PARTS, which, workspace_root
 
 _CACHE: dict[str, Any] | None = None
 _CACHE_ROOT: str | None = None
+_MAX_ARTIFACT_VISITS = 800
+_SKIP_ARTIFACT_DIRS = SKIP_PARTS | {
+    ".idea", ".gradle", ".cache", ".m2", "vendor", "out",
+}
 
 
 def detect(cwd: str | None = None) -> dict[str, Any]:
@@ -95,6 +99,10 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
                 "io.github.vedanthvdev.affectedtests" in combined_java_build
                 or "affectedtest" in combined_java_build
             ),
+            "ekstazi_seeded": _has_named_dir(root, ".ekstazi"),
+            "starts_seeded": _has_named_dir(root, ".starts"),
+            "joern_cpg": _has_named_file(root, "cpg.bin"),
+            "jacoco_per_test": _has_jacoco_per_test(root),
             "scalpel": _can_import("scalpel"),
             "coverage": _can_import("coverage"),
         },
@@ -113,6 +121,95 @@ def _can_import(mod: str) -> bool:
 
 def _has_testmon(root: Path) -> bool:
     return _can_import("testmon")
+
+
+def _module_roots(root: Path) -> list[Path]:
+    """Root plus immediate child modules that look like Maven/Gradle projects."""
+    roots = [root]
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return roots
+    for child in children:
+        if not child.is_dir() or child.name in _SKIP_ARTIFACT_DIRS or child.name.startswith("."):
+            continue
+        if any((child / name).exists() for name in (
+            "pom.xml", "build.gradle", "build.gradle.kts",
+        )):
+            roots.append(child)
+        if len(roots) >= 40:
+            break
+    return roots
+
+
+def _has_named_dir(root: Path, name: str) -> bool:
+    for base in _module_roots(root):
+        candidate = base / name
+        if candidate.is_dir():
+            return True
+    visits = 0
+    for dirpath, dirnames, _filenames in os.walk(root):
+        visits += 1
+        if visits > _MAX_ARTIFACT_VISITS:
+            break
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SKIP_ARTIFACT_DIRS and not d.startswith(".")
+        ]
+        if (Path(dirpath) / name).is_dir():
+            return True
+    return False
+
+
+def _has_named_file(root: Path, name: str) -> bool:
+    for base in _module_roots(root):
+        if (base / name).is_file():
+            return True
+    visits = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        visits += 1
+        if visits > _MAX_ARTIFACT_VISITS:
+            break
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SKIP_ARTIFACT_DIRS and not d.startswith(".")
+        ]
+        if name in filenames:
+            return True
+    return False
+
+
+def _has_jacoco_per_test(root: Path) -> bool:
+    """Check common Maven/Gradle report folders only — never a full-tree ** glob."""
+    rel_dirs = (
+        Path("target") / "jacoco" / "per-test",
+        Path("target") / "jacoco" / "sessions",
+        Path("target") / "jacoco-per-test",
+        Path("build") / "jacoco" / "per-test",
+        Path("build") / "jacoco" / "sessions",
+        Path("build") / "jacoco-per-test",
+        Path("build") / "reports" / "jacoco" / "per-test",
+    )
+    for base in _module_roots(root):
+        for rel in rel_dirs:
+            folder = base / rel
+            if not folder.is_dir():
+                continue
+            try:
+                for path in folder.iterdir():
+                    if path.is_file() and path.suffix.lower() == ".xml" and path.name != "jacoco.xml":
+                        return True
+            except OSError:
+                continue
+        jacoco = base / "target" / "jacoco"
+        if jacoco.is_dir():
+            try:
+                for path in jacoco.glob("session_*.xml"):
+                    if path.is_file():
+                        return True
+            except OSError:
+                pass
+    return False
 
 
 def _wrapper_or_path(root: Path, name: str) -> str | None:

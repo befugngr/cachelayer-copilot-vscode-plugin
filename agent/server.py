@@ -21,10 +21,10 @@ from tia import run_affected_tests
 _VERIFY = {
     "name": "verify_edit",
     "description": (
-        "After you edit code, call ONCE to catch type/lint errors before more LLM turns. "
-        "Runs mypy then ruff (Python), tsc --noEmit then eslint (JS/TS). "
-        "Runs affected tests only if typecheck and lint pass. "
-        "Pass the files you just edited. Do not call on markdown, reads, or every step."
+        "After one coherent edit batch, call ONCE with mode=coherent and a stable edit_cycle_id. "
+        "Independent typecheck/lint prerequisites run concurrently; affected tests run only if all pass. "
+        "On failure, follow feedback.action with one coherent re-edit, reuse the cycle ID, and stop at the cap. "
+        "The tool never edits code. Do not call on markdown, reads, or every keystroke."
     ),
     "inputSchema": {
         "type": "object",
@@ -38,6 +38,23 @@ _VERIFY = {
                 "description": "Optional [start_line, end_line] to filter diagnostics",
             },
             "run_tests": {"type": "boolean", "default": True},
+            "mode": {
+                "type": "string",
+                "enum": ["fast", "coherent"],
+                "default": "coherent",
+                "description": "fast is file-scoped; coherent is the explicit post-batch full gate.",
+            },
+            "edit_cycle_id": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "Stable ID reused only for the bounded edit/critic/re-edit cycle.",
+            },
+            "max_retries": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 3,
+            },
         },
     },
 }
@@ -45,11 +62,10 @@ _VERIFY = {
 _TIA = {
     "name": "run_affected_tests",
     "description": (
-        "Run ONLY tests that touch the current change: pytest-testmon or coverage contexts, "
-        "Jest findRelatedTests, Maven Surefire/STARTS/Ekstazi/Smart Test Picker, or Gradle "
-        "--tests/affectedTest/Smart Test Picker. Reports JaCoCo changed-line coverage separately "
-        "from test selection and uses a bounded static Java forward-slice when no dynamic map exists. "
-        "Use this instead of the full test suite after edits. Do not poll a long full run."
+        "Run only safely selected tests. Priority is Smart Test Picker, seeded STARTS/Ekstazi, "
+        "safety-inspected Gradle affectedTest, native per-test JaCoCo reports, then bounded static "
+        "type/import/Joern selection. Aggregate jacoco.xml is validation only. FULL_SUITE escalation "
+        "is refused. Set seed_rts=true only to return a non-mutating install/baseline plan."
     ),
     "inputSchema": {
         "type": "object",
@@ -58,7 +74,13 @@ _TIA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Changed files; default git diff",
-            }
+            },
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 300, "default": 45},
+            "seed_rts": {
+                "type": "boolean",
+                "default": False,
+                "description": "Return a dry-run RTS install/seed plan; never rewrites build files.",
+            },
         },
     },
 }
@@ -127,12 +149,27 @@ _DEBUG = {
 }
 
 
-def _verify(paths=None, line_range=None, run_tests=True, **_kw):
-    return verify_edit(paths=paths, line_range=line_range, run_tests=bool(run_tests), hook=False)
+def _verify(
+    paths=None, line_range=None, run_tests=True, mode="coherent",
+    edit_cycle_id=None, max_retries=3, **_kw
+):
+    return verify_edit(
+        paths=paths,
+        line_range=line_range,
+        run_tests=bool(run_tests),
+        hook=False,
+        mode=mode if mode in ("fast", "coherent") else "coherent",
+        edit_cycle_id=edit_cycle_id,
+        max_retries=max_retries,
+    )
 
 
-def _tia(changed_files=None, **_kw):
-    return run_affected_tests(changed_files=changed_files)
+def _tia(changed_files=None, timeout=45, seed_rts=False, **_kw):
+    return run_affected_tests(
+        changed_files=changed_files,
+        timeout=max(1, min(int(timeout), 300)),
+        seed_rts=bool(seed_rts),
+    )
 
 
 def _debug(

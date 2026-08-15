@@ -4,14 +4,15 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 try:
-    from .util import SKIP_PARTS
+    from .util import SKIP_PARTS, run_cmd
 except ImportError:
-    from util import SKIP_PARTS
+    from util import SKIP_PARTS, run_cmd
 
 MAX_SCAN_FILES = 4000
 MAX_TESTS = 50
@@ -35,6 +36,19 @@ _SMART_MAPS = (
 _SMART_SELECTIONS = (
     "build/selected-tests.json",
     "target/selected-tests.json",
+)
+_PER_TEST_JACOCO_PATTERNS = (
+    "**/jacoco/session_*.xml",
+    "**/jacoco/sessions/*.xml",
+    "**/jacoco/per-test/*.xml",
+    "**/jacoco-per-test/*.xml",
+    "**/test-coverage/*.xml",
+)
+_JOERN_OUTPUTS = (
+    "joern-slices.json",
+    "build/joern-slices.json",
+    "target/joern-slices.json",
+    ".cache/cachelayer/joern-slices.json",
 )
 
 
@@ -97,6 +111,282 @@ def smart_test_picker_selection(root: Path) -> dict[str, Any] | None:
         "total": total,
         "skipped_estimate": max(0, total - len(tests)) if total is not None else None,
         "file": path.relative_to(root).as_posix(),
+    }
+
+
+def _test_name_from_report(path: Path, report: ET.Element) -> str | None:
+    """Infer the owning test from an explicitly per-test JaCoCo report."""
+    for key in ("test", "testName"):
+        value = (report.get(key) or "").strip()
+        if value and value.lower() not in {"unknown", "default"}:
+            return value.split("#", 1)[0]
+    test_name = re.compile(r"(?:Test|Tests|IT)(?:$|[#.])")
+    for key in ("sessionid", "sessionId"):
+        value = (report.get(key) or "").strip()
+        if value and test_name.search(value):
+            return value.split("#", 1)[0]
+    session = next(iter(report.iter("sessioninfo")), None)
+    if session is not None:
+        value = (session.get("id") or "").strip()
+        if value and test_name.search(value):
+            return value.split("#", 1)[0]
+    stem = path.stem
+    for prefix in ("session_", "jacoco_", "coverage_"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    return stem.replace("__", ".") if re.search(r"(?:Test|Tests|IT)(?:$|[#.])", stem) else None
+
+
+def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str, Any]:
+    """Select tests from distinct per-test JaCoCo XML reports.
+
+    A normal aggregate ``jacoco.xml`` is deliberately excluded. JaCoCo ``.exec``
+    is binary and does not identify tests unless a harness emitted distinct
+    sessions/reports, so opaque aggregate exec files are only reported as hints.
+    """
+    changed = {_fq_class(rel) for rel in changed_files if Path(rel).suffix.lower() in (".java", ".kt", ".kts")}
+    changed.discard("")
+    if not changed:
+        return {"available": False, "tests": [], "reason": "no changed Java classes"}
+    candidates: list[Path] = []
+    for pattern in _PER_TEST_JACOCO_PATTERNS:
+        for path in root.glob(pattern):
+            if path.is_file() and path.name != "jacoco.xml" and path not in candidates:
+                candidates.append(path)
+            if len(candidates) >= 200:
+                break
+        if len(candidates) >= 200:
+            break
+    tests: list[str] = []
+    parsed: list[str] = []
+    for path in candidates:
+        try:
+            report = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        test = _test_name_from_report(path, report)
+        if not test:
+            continue
+        covered: set[str] = set()
+        for cls in report.iter("class"):
+            name = (cls.get("name") or "").replace("/", ".")
+            if not name:
+                continue
+            if any(
+                counter.get("type") in ("INSTRUCTION", "LINE")
+                and int(counter.get("covered") or 0) > 0
+                for counter in cls.findall("counter")
+            ):
+                covered.add(name)
+        parsed.append(path.relative_to(root).as_posix())
+        if any(name in covered or any(c.startswith(name + "$") for c in covered) for name in changed):
+            if test not in tests:
+                tests.append(test)
+    exec_files = [
+        path.relative_to(root).as_posix()
+        for path in list(root.glob("**/jacoco*.exec"))[:50] if path.is_file()
+    ]
+    if not parsed:
+        reason = "no distinct per-test JaCoCo XML/session reports"
+        if exec_files:
+            reason += "; aggregate/binary exec data cannot identify owning tests"
+        return {
+            "available": False, "tests": [], "reason": reason,
+            "exec_files": exec_files,
+            "install": "Configure one JaCoCo XML report/session per test; aggregate jacoco.xml is validation only.",
+        }
+    return {
+        "available": True,
+        "tests": tests[:MAX_TESTS],
+        "reports": parsed[:200],
+        "source": "jacoco-native-per-test-xml",
+        "reason": "per-test JaCoCo reports",
+    }
+
+
+def native_rts_selection(root: Path, kind: str, inventory_count: int | None = None) -> dict[str, Any]:
+    """Estimate selected tests from native STARTS/Ekstazi artifacts."""
+    base_name = ".starts" if kind == "starts" else ".ekstazi"
+    bases = [path for path in root.glob(f"**/{base_name}") if path.is_dir()][:20]
+    tests: list[str] = []
+    files: list[str] = []
+    test_re = re.compile(r"\b(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)(?:#[\w$]+)?\b")
+    for base in bases:
+        for path in list(base.rglob("*"))[:1000]:
+            if not path.is_file():
+                continue
+            files.append(path.relative_to(root).as_posix())
+            names = test_re.findall(path.name.replace("-", "."))
+            if path.stat().st_size <= 256_000:
+                try:
+                    names.extend(test_re.findall(path.read_text(**_READ)))
+                except OSError:
+                    pass
+            for name in names:
+                value = name.split("#", 1)[0].removesuffix(".clz")
+                if value not in tests:
+                    tests.append(value)
+                if len(tests) >= MAX_TESTS:
+                    break
+            if len(tests) >= MAX_TESTS:
+                break
+    selected = len(tests) if tests else None
+    return {
+        "available": bool(bases),
+        "tests": tests,
+        "selected": selected,
+        "skipped_estimate": (
+            max(0, inventory_count - selected)
+            if inventory_count is not None and selected is not None else None
+        ),
+        "artifacts": files[:100],
+        "source": f"{kind}-native-artifacts" if tests else f"{kind}-report-diff-fallback",
+    }
+
+
+def rts_seed_plan(root: Path, info: dict[str, Any]) -> dict[str, Any]:
+    """Return a non-mutating install/seed plan for Java RTS selectors."""
+    flags = info.get("flags") or {}
+    maven = bool(info.get("maven"))
+    gradle = bool(info.get("gradle"))
+    artifacts = {
+        "smart_test_picker_map": smart_test_picker_map(root),
+        "starts_database": next(
+            (path.relative_to(root).as_posix() for path in root.glob("**/.starts") if path.is_dir()),
+            None,
+        ),
+        "ekstazi_database": next(
+            (path.relative_to(root).as_posix() for path in root.glob("**/.ekstazi") if path.is_dir()),
+            None,
+        ),
+        "jacoco_per_test_reports": bool(
+            next((path for pattern in _PER_TEST_JACOCO_PATTERNS for path in root.glob(pattern) if path.is_file()), None)
+        ),
+    }
+    options: list[dict[str, Any]] = []
+    if maven:
+        options.extend([
+            {
+                "selector": "smart-test-picker",
+                "configured": bool(flags.get("smart_test_picker")),
+                "seeded": bool(artifacts["smart_test_picker_map"]),
+                "guidance": "Add Smart Test Picker in an explicit Maven profile, then run its documented baseline goal once.",
+                "additive_profile": (
+                    "<profile><id>cachelayer-rts-smart-picker</id><build><plugins><plugin>"
+                    "<groupId>com.sap.oss.smart-test-picker</groupId>"
+                    "<artifactId>smart-test-picker-maven</artifactId>"
+                    "<version>${smart-test-picker.version}</version>"
+                    "</plugin></plugins></build></profile>"
+                ),
+            },
+            {
+                "selector": "starts",
+                "configured": bool(flags.get("starts")),
+                "seeded": bool(artifacts["starts_database"]),
+                "guidance": "Add starts-maven-plugin in an explicit profile; run a baseline starts:starts only after reviewing its config.",
+                "additive_profile": (
+                    "<profile><id>cachelayer-rts-starts</id><build><plugins><plugin>"
+                    "<groupId>edu.illinois</groupId><artifactId>starts-maven-plugin</artifactId>"
+                    "<version>${starts.version}</version>"
+                    "</plugin></plugins></build></profile>"
+                ),
+            },
+            {
+                "selector": "ekstazi",
+                "configured": bool(flags.get("ekstazi")),
+                "seeded": bool(artifacts["ekstazi_database"]),
+                "guidance": "Add the Ekstazi Maven plugin in an explicit profile and run one reviewed baseline test.",
+                "additive_profile": (
+                    "<profile><id>cachelayer-rts-ekstazi</id><build><plugins><plugin>"
+                    "<groupId>org.ekstazi</groupId><artifactId>ekstazi-maven-plugin</artifactId>"
+                    "<version>${ekstazi.version}</version>"
+                    "</plugin></plugins></build></profile>"
+                ),
+            },
+        ])
+    if gradle:
+        options.append({
+            "selector": "affectedTest",
+            "configured": bool(flags.get("affected_tests")),
+            "seeded": bool(flags.get("affected_tests")),
+            "guidance": "Apply affectedtests explicitly, configure full-suite fallback off, and verify affectedTest --explain before execution.",
+            "additive_snippet": (
+                "plugins { id(\"io.github.vedanthvdev.affectedtests\") "
+                "version \"[PIN_REVIEWED_VERSION]\" }\n"
+                "// Configure the plugin's documented full-suite fallback setting to false."
+            ),
+        })
+    return {
+        "plan_only": True,
+        "mutated_build_files": False,
+        "artifacts": artifacts,
+        "options": options,
+        "summary": "No build files or seed databases were changed; review one additive profile/snippet and baseline command.",
+    }
+
+
+def joern_slice_selection(
+    root: Path, changed_files: list[str], joern_slice: str | None = None
+) -> dict[str, Any]:
+    """Read or generate a bounded Joern usage/call slice."""
+    path = next((root / rel for rel in _JOERN_OUTPUTS if (root / rel).is_file()), None)
+    generated: tempfile.TemporaryDirectory[str] | None = None
+    command_result: dict[str, Any] | None = None
+    cpg = next((candidate for candidate in root.glob("**/cpg.bin") if candidate.is_file()), None)
+    if path is None and cpg is not None and joern_slice:
+        cache = Path.home() / ".cache" / "cachelayer-toolchain"
+        cache.mkdir(parents=True, exist_ok=True)
+        generated = tempfile.TemporaryDirectory(prefix="tia-joern-", dir=cache)
+        path = Path(generated.name) / "slices.json"
+        command_result = run_cmd(
+            [joern_slice, "usages", "--out", str(path), str(cpg)],
+            cwd=root,
+            timeout=20,
+        )
+        if not command_result.get("ok") or not path.is_file():
+            generated.cleanup()
+            return {
+                "available": False, "tests": [],
+                "reason": "joern-slice failed; using bounded static type/import slice",
+                "detail": str(command_result.get("output") or "")[-500:],
+            }
+    if path is None:
+        return {
+            "available": False, "tests": [],
+            "reason": "no cpg.bin/joern-slice output; using bounded static type/import slice",
+        }
+    try:
+        if path.stat().st_size > 5_000_000:
+            return {"available": False, "tests": [], "reason": "Joern slice exceeds 5 MB parse bound"}
+        payload = json.loads(path.read_text(**_READ))
+    except (OSError, ValueError) as exc:
+        return {"available": False, "tests": [], "reason": f"unreadable Joern slice: {exc}"}
+    finally:
+        if generated is not None:
+            generated.cleanup()
+    changed_symbols = {Path(rel).stem for rel in changed_files}
+    tests: list[str] = []
+    records = payload if isinstance(payload, list) else payload.get("slices", payload.get("results", []))
+    for record in records[:2000] if isinstance(records, list) else []:
+        text = json.dumps(record, ensure_ascii=True)
+        if changed_symbols and not any(re.search(rf"\b{re.escape(symbol)}\b", text) for symbol in changed_symbols):
+            continue
+        for match in re.findall(r"(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)", text):
+            if match not in tests:
+                tests.append(match)
+            if len(tests) >= MAX_TESTS:
+                break
+    try:
+        report_file = path.relative_to(root).as_posix()
+    except ValueError:
+        report_file = "temporary joern-slice output"
+    return {
+        "available": True,
+        "tests": tests,
+        "file": report_file,
+        "source": "joern-usage-call-slice",
+        "reason": "generated Joern usage slice" if command_result is not None else "existing Joern slice output",
     }
 
 
@@ -241,7 +531,13 @@ def _jacoco_report(root: Path) -> Path | None:
         if path.is_file():
             return path
     for path in root.rglob("jacoco*.xml"):
-        if path.is_file() and not (set(path.relative_to(root).parts) & SKIP_PARTS - {"target", "build"}):
+        parts = set(path.relative_to(root).parts)
+        if (
+            path.is_file()
+            and not (parts & SKIP_PARTS - {"target", "build"})
+            and not (parts & {"per-test", "sessions", "jacoco-per-test", "test-coverage"})
+            and not path.stem.startswith("session_")
+        ):
             return path
     return None
 
@@ -283,7 +579,13 @@ def _fq_class(rel: str) -> str:
     return ".".join(parts)
 
 
-def _java_source_info(root: Path) -> dict[str, dict[str, str]]:
+def _strip_java_noncode(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
+
+
+def _java_source_info(root: Path) -> dict[str, dict[str, Any]]:
     """Index bounded Java/Kotlin source files by relative path."""
     result: dict[str, dict[str, str]] = {}
     for path in _walk(root, (".java", ".kt", ".kts")):
@@ -292,10 +594,14 @@ def _java_source_info(root: Path) -> dict[str, dict[str, str]]:
             text = path.read_text(**_READ)
         except OSError:
             continue
+        code = _strip_java_noncode(text)
+        package_match = re.search(r"^\s*package\s+([\w.]+)\s*;?", code, re.MULTILINE)
         result[rel] = {
             "fq": _fq_class(rel),
             "simple": path.stem,
-            "text": text,
+            "text": code,
+            "package": package_match.group(1) if package_match else "",
+            "imports": set(re.findall(r"^\s*import\s+(?:static\s+)?([\w.*$]+)\s*;?", code, re.MULTILINE)),
             "test": str("/src/test/" in f"/{rel}" or path.stem.endswith(("Test", "Tests", "IT"))),
         }
     return result
@@ -318,19 +624,32 @@ def java_dependents(root: Path, changed_files: list[str], depth: int = 2) -> dic
     dependents: list[str] = []
     tests: list[str] = []
     for _ in range(max(1, min(depth, 4))):
-        targets = [(index[rel]["fq"], index[rel]["simple"]) for rel in frontier]
+        targets = [
+            (index[rel]["fq"], index[rel]["simple"], index[rel]["package"])
+            for rel in frontier
+        ]
         found: set[str] = set()
         for rel, item in index.items():
             if rel in seen:
                 continue
             text = item["text"]
             matched = False
-            for fq, simple in targets:
+            for fq, simple, package in targets:
                 if not simple or simple not in text:
                     continue
-                if (
-                    (fq and re.search(rf"^\s*import\s+{re.escape(fq)}\s*;?", text, re.MULTILINE))
-                    or re.search(rf"\b{re.escape(simple)}\b", text)
+                imports = item["imports"]
+                explicit_import = fq in imports or any(
+                    value.endswith(".*") and fq.startswith(value[:-1]) for value in imports
+                )
+                same_package = bool(package and package == item["package"])
+                type_use = re.search(
+                    rf"\b(?:new\s+|extends\s+|implements\s+|instanceof\s+)?"
+                    rf"{re.escape(simple)}(?:\s*<[^;{{}}]+>)?"
+                    rf"\s*(?:[A-Za-z_$][\w$]*|\(|\.|::|\[)",
+                    text,
+                )
+                if explicit_import or (same_package and type_use) or (
+                    explicit_import and re.search(rf"\b{re.escape(simple)}\b", text)
                 ):
                     matched = True
                     break
@@ -351,6 +670,7 @@ def java_dependents(root: Path, changed_files: list[str], depth: int = 2) -> dic
         "tests": tests[:40],
         "dependents": dependents[:100],
         "hops": min(depth, 4),
+        "method": "bounded-java-type-import-forward-slice",
     }
 
 
