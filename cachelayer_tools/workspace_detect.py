@@ -2,24 +2,39 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
 try:
-    from .util import SKIP_PARTS, which, workspace_root
+    from .process_util import SKIP_PARTS, which, workspace_root
 except ImportError:
-    from util import SKIP_PARTS, which, workspace_root
+    from process_util import SKIP_PARTS, which, workspace_root
 
 _CACHE: dict[str, Any] | None = None
 _CACHE_ROOT: str | None = None
+
+# Soft skips used by other callers; artifact walk uses the hard set below.
 _SKIP_ARTIFACT_DIRS = SKIP_PARTS | {
     ".idea", ".gradle", ".cache", ".m2", "vendor", "out",
 }
 _HARD_SKIP_ARTIFACT_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", ".tox",
-    "__pycache__", ".m2", "vendor",
+    "__pycache__", ".m2", "vendor", ".idea", ".gradle", ".cache", "out",
 }
+# Bound discovery so large trees cannot claim a complete unbounded scan.
+_MAX_ARTIFACT_DIRS = 800
+_MAX_ARTIFACT_ENTRIES = 20_000
+_TOOLCHAIN = Path.home() / ".cache" / "cachelayer-toolchain"
+
+
+def invalidate_detect() -> None:
+    """Clear process-local detection after preparation creates new artifacts."""
+    global _CACHE, _CACHE_ROOT
+    _CACHE = None
+    _CACHE_ROOT = None
 
 
 def detect(cwd: str | None = None) -> dict[str, Any]:
@@ -62,11 +77,11 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
     combined_java_build = (pom_text + "\n" + gradle_text).lower()
     py_sources = any(root.glob("*.py")) or any(root.glob("src/**/*.py"))
     artifacts = _artifact_inventory(root)
-    analysis_python = (
-        which("cachelayer-analysis-python")
-        or which("python3")
-        or which("python")
+    analysis_python = _analysis_python()
+    analysis_imports = _tool_imports(
+        analysis_python, ("testmon", "scalpel", "coverage")
     )
+    flacoco_jar = _flacoco_jar()
     info = {
         "root": str(root),
         # Global pytest/mypy/ruff installs do not make a Java workspace Python.
@@ -95,6 +110,7 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
             "joern-slice": which("joern-slice"),
             "joern-parse": which("joern-parse"),
             "flacoco": which("flacoco"),
+            "flacoco_jar": flacoco_jar,
             "gzoltar": which("gzoltar"),
             "coverage": which("coverage"),
             "analysis-python": analysis_python,
@@ -102,7 +118,9 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
         "flags": {
             "tsconfig": tsconfig,
             "eslint_config": eslint_cfg,
-            "testmon": _can_import("testmon") or _tool_can_import(analysis_python, "testmon"),
+            # Prefer the dedicated analysis interpreter; do not treat a bare
+            # system Python as proof that pytest-testmon/Scalpel are available.
+            "testmon": analysis_imports["testmon"],
             "ekstazi": "ekstazi" in combined_java_build,
             "jacoco": "jacoco" in combined_java_build,
             "starts": "starts-maven-plugin" in combined_java_build,
@@ -115,14 +133,44 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
             "starts_seeded": bool(artifacts["starts"]),
             "joern_cpg": bool(artifacts["cpg"]),
             "jacoco_per_test": bool(artifacts["jacoco_per_test"]),
-            "artifact_scan_complete": True,
-            "scalpel": _can_import("scalpel") or _tool_can_import(analysis_python, "scalpel"),
-            "coverage": _can_import("coverage") or _tool_can_import(analysis_python, "coverage"),
+            "artifact_scan_complete": bool(artifacts.get("scan_complete", True)),
+            "scalpel": analysis_imports["scalpel"],
+            "coverage": (
+                analysis_imports["coverage"]
+                or _can_import("coverage")
+            ),
         },
     }
     _CACHE = info
     _CACHE_ROOT = key
     return info
+
+
+def _analysis_python() -> str | None:
+    """Return only an explicit analysis interpreter, never a silent system fallback."""
+    for key in ("CACHELAYER_ANALYSIS_PYTHON", "CACHELAYER_TOOLCHAIN_PYTHON"):
+        configured = os.environ.get(key, "").strip()
+        if configured and Path(configured).exists():
+            return configured
+    wrapper = which("cachelayer-analysis-python")
+    if wrapper:
+        return wrapper
+    venv_python = _TOOLCHAIN / "python-analysis" / "bin" / "python"
+    if venv_python.is_file():
+        return str(venv_python)
+    return None
+
+
+def _flacoco_jar() -> str | None:
+    configured = os.environ.get("FLACOCO_JAR", "").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    candidate = (
+        _TOOLCHAIN / "flacoco" / "flacoco-1.0.6-jar-with-dependencies.jar"
+    )
+    if candidate.is_file():
+        return str(candidate)
+    return None
 
 
 def _can_import(mod: str) -> bool:
@@ -133,35 +181,56 @@ def _can_import(mod: str) -> bool:
 
 
 def _tool_can_import(python: str | None, module: str) -> bool:
-    if not python:
-        return False
-    try:
-        import subprocess
+    return _tool_imports(python, (module,))[module]
 
+
+def _tool_imports(python: str | None, modules: tuple[str, ...]) -> dict[str, bool]:
+    """Probe optional analysis modules in one bounded interpreter startup."""
+    found = {module: False for module in modules}
+    if not python or not modules:
+        return found
+    try:
+        script = (
+            "import importlib.util,json;"
+            f"mods={list(modules)!r};"
+            "print(json.dumps({m:importlib.util.find_spec(m) is not None for m in mods}))"
+        )
         result = subprocess.run(
-            [python, "-c", f"import {module}"],
+            [python, "-c", script],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=3,
             check=False,
+            text=True,
         )
-        return result.returncode == 0
+        value = json.loads(result.stdout) if result.returncode == 0 else {}
+        if isinstance(value, dict):
+            return {module: value.get(module) is True for module in modules}
     except (OSError, subprocess.SubprocessError):
-        return False
+        pass
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return found
 
 
-def _artifact_inventory(root: Path) -> dict[str, list[str]]:
-    """Find TIA artifacts in arbitrarily deep modules with one pruned full scan.
+def _artifact_inventory(root: Path) -> dict[str, Any]:
+    """Find TIA artifacts with a pruned, budgeted scan.
 
-    Dependency/VCS trees cannot contain project-owned RTS state. Build trees are
-    visited, but class/resource fan-out is pruned after checking their known
-    report locations. Extra non-standard roots can be supplied through
-    CACHELAYER_TIA_ARTIFACT_PATHS (os.pathsep-separated).
+    Dependency/VCS/cache trees are skipped. Build trees are visited, but
+    class/resource fan-out is pruned after checking known report locations.
+    Extra non-standard roots can be supplied through
+    CACHELAYER_TIA_ARTIFACT_PATHS (os.pathsep-separated). When the directory
+    or entry budget is hit, scan_complete is false.
     """
-    found: dict[str, list[str]] = {
+    found: dict[str, Any] = {
         "modules": [], "ekstazi": [], "starts": [], "cpg": [],
         "jacoco_per_test": [],
+        "scan_complete": True,
+        "dirs_visited": 0,
+        "entries_seen": 0,
+        "budget_dirs": _MAX_ARTIFACT_DIRS,
+        "budget_entries": _MAX_ARTIFACT_ENTRIES,
     }
     scan_roots = [root]
     for raw in os.environ.get("CACHELAYER_TIA_ARTIFACT_PATHS", "").split(os.pathsep):
@@ -172,7 +241,12 @@ def _artifact_inventory(root: Path) -> dict[str, list[str]]:
             scan_roots.append(path)
 
     seen: set[tuple[int, int]] = set()
+    dirs_visited = 0
+    entries_seen = 0
+    capped = False
     for scan_root in scan_roots:
+        if capped:
+            break
         for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False):
             current = Path(dirpath)
             try:
@@ -185,6 +259,13 @@ def _artifact_inventory(root: Path) -> dict[str, list[str]]:
                 dirnames[:] = []
                 continue
             seen.add(identity)
+
+            dirs_visited += 1
+            entries_seen += len(dirnames) + len(filenames)
+            if dirs_visited > _MAX_ARTIFACT_DIRS or entries_seen > _MAX_ARTIFACT_ENTRIES:
+                capped = True
+                dirnames[:] = []
+                break
 
             if any(name in filenames for name in ("pom.xml", "build.gradle", "build.gradle.kts")):
                 found["modules"].append(_display_path(current, root))
@@ -212,7 +293,13 @@ def _artifact_inventory(root: Path) -> dict[str, list[str]]:
             ]
             if current.name in {"classes", "test-classes", "generated", "tmp"}:
                 dirnames[:] = []
-    return {key: list(dict.fromkeys(values)) for key, values in found.items()}
+
+    found["dirs_visited"] = dirs_visited
+    found["entries_seen"] = entries_seen
+    found["scan_complete"] = not capped
+    for key in ("modules", "ekstazi", "starts", "cpg", "jacoco_per_test"):
+        found[key] = list(dict.fromkeys(found[key]))
+    return found
 
 
 def _is_per_test_jacoco_dir(path: Path) -> bool:

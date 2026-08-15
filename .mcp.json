@@ -9,7 +9,7 @@
     },
     "cachelayer-agent": {
       "type": "stdio",
-      "command": "./agent/run.sh",
+      "command": "./cachelayer_tools/run_mcp.sh",
       "env": {
         "CACHELAYER_WORKSPACE_ROOT": "${workspaceFolder}"
       }

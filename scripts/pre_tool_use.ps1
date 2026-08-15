@@ -7,13 +7,29 @@ $TimeoutSec = 5
 if ($env:CACHELAYER_HOOK_TIMEOUT_S) { [void][int]::TryParse($env:CACHELAYER_HOOK_TIMEOUT_S, [ref]$TimeoutSec) }
 
 $InputJson = [Console]::In.ReadToEnd()
-if ([string]::IsNullOrWhiteSpace($InputJson)) {
+if ([string]::IsNullOrWhiteSpace($InputJson) -or $InputJson.Length -gt 262144) {
   Write-Output '{"continue":true}'
   exit 0
 }
 
 if ([string]::IsNullOrWhiteSpace($Token)) {
   Write-Output '{"continue":true,"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"cachelayer_no_token"}}'
+  exit 0
+}
+
+$Filter = Join-Path $PSScriptRoot 'filter_hook_payload.py'
+if (Get-Command py -ErrorAction SilentlyContinue) {
+  $InputJson = $InputJson | py -3 $Filter
+} elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
+  $InputJson = $InputJson | python3 $Filter
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+  $InputJson = $InputJson | python $Filter
+} else {
+  Write-Output '{"continue":true}'
+  exit 0
+}
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($InputJson)) {
+  Write-Output '{"continue":true}'
   exit 0
 }
 

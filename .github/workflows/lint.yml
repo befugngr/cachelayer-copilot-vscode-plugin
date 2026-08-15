@@ -26,8 +26,13 @@ jobs:
               sys.exit(1)
           print("OK plugin.json required fields")
           PY
+      - name: Python syntax check
+        run: python3 -m py_compile cachelayer_tools/*.py scripts/*.py
       - name: Bash syntax check
-        run: bash -n scripts/pre_tool_use.sh
+        run: |
+          for script in cachelayer_tools/*.sh scripts/*.sh; do
+            test ! -f "$script" || bash -n "$script"
+          done
       - name: Markdown presence
         run: test -f README.md && test -f skills/cachelayer-tools/SKILL.md
       - name: BUILD_REPORT must not be committed

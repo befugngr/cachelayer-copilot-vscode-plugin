@@ -6,19 +6,20 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 try:
-    from .detect import detect
-    from .util import (
+    from .workspace_detect import detect
+    from .process_util import (
         HOOK_MAX_CHARS, HOOK_TIMEOUT_S, MAX_TOOL_CHARS, cap_text,
         git_changed_files, is_code_path, rel_to_root, run_cmd, which,
     )
 except ImportError:
-    from detect import detect
-    from util import (
+    from workspace_detect import detect
+    from process_util import (
         HOOK_MAX_CHARS, HOOK_TIMEOUT_S, MAX_TOOL_CHARS, cap_text,
         git_changed_files, is_code_path, rel_to_root, run_cmd, which,
     )
@@ -32,7 +33,6 @@ _LINE_RE = re.compile(
 )
 MAX_PARALLEL_GATES = 3
 MAX_RETRIES = 3
-_STATE_DIR = ".cachelayer"
 _RETRY_FILE = "critic-retry.json"
 
 
@@ -122,7 +122,9 @@ def _cycle_id(root: Path, files: list[str], supplied: str | None) -> str:
 
 
 def _state_path(root: Path) -> Path:
-    return root / _STATE_DIR / _RETRY_FILE
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:20]
+    return cache / "cachelayer" / "critic" / key / _RETRY_FILE
 
 
 def _read_retry(root: Path) -> dict[str, Any]:
@@ -144,9 +146,16 @@ def _write_retry(root: Path, data: dict[str, Any] | None) -> None:
                 pass
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
-        temporary.replace(path)
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(data, stream, separators=(",", ":"))
+            os.replace(name, path)
+        finally:
+            try:
+                Path(name).unlink(missing_ok=True)
+            except OSError:
+                pass
     except OSError:
         # Feedback state must never make an editor hook fail closed.
         return
@@ -193,6 +202,21 @@ def _feedback(
             "Make one coherent edit addressing all diagnostics, then call verify_edit once with the same cycle_id."
         ),
     }
+
+
+def _compile_python_files(root: Path, files: list[str]) -> dict[str, Any]:
+    errors: list[str] = []
+    for rel in files[:100]:
+        path = root / rel
+        try:
+            source = path.read_text(encoding="utf-8")
+            if len(source) > 2_000_000:
+                raise ValueError("source exceeds 2 MB compile bound")
+            compile(source, str(path), "exec", dont_inherit=True)
+        except (OSError, UnicodeError, SyntaxError, ValueError) as exc:
+            line = getattr(exc, "lineno", 1) or 1
+            errors.append(f"{rel}:{line}: {type(exc).__name__}: {exc}")
+    return {"ok": not errors, "code": 0 if not errors else 1, "output": "\n".join(errors)}
 
 
 def verify_edit(
@@ -257,9 +281,8 @@ def verify_edit(
     # Build independent prerequisite jobs. Captured defaults avoid late binding.
     if py_files:
         if hook and not coherent:
-            jobs.append(("py-compile", lambda py_files=py_files: run_cmd(
-                [info["tools"].get("python3") or "python", "-m", "py_compile", *py_files],
-                cwd=root, timeout=timeout,
+            jobs.append(("py-compile", lambda py_files=py_files: _compile_python_files(
+                root, py_files,
             ), py_files))
         elif info["tools"].get("mypy"):
             jobs.append(("mypy", lambda py_files=py_files: run_cmd(
@@ -321,27 +344,27 @@ def verify_edit(
     if run_tests and full_gate and not blocked:
         tests_ran = True
         try:
-            from .tia import run_affected_tests
+            from .affected_tests import run_affected_tests
         except ImportError:
-            from tia import run_affected_tests
-        tia = run_affected_tests(changed_files=files or None, cwd=str(root), timeout=timeout)
-        if tia.get("available") is False:
+            from affected_tests import run_affected_tests
+        affected = run_affected_tests(changed_files=files or None, cwd=str(root), timeout=timeout)
+        if affected.get("available") is False:
             tests_ran = False
             gates.append({
                 "name": "tests",
                 "available": False,
                 "skipped": True,
-                "install": tia.get("install"),
-                "output": cap_text(tia.get("summary") or "", MAX_TOOL_CHARS),
+                "install": affected.get("install"),
+                "output": cap_text(affected.get("summary") or "", MAX_TOOL_CHARS),
             })
         else:
             gates.append({
                 "name": "tests",
-                "ok": bool(tia.get("ok")),
-                "output": cap_text(tia.get("failures") or tia.get("summary") or "", MAX_TOOL_CHARS),
-                "tia": {k: tia.get(k) for k in ("selected", "skipped_estimate", "runner")},
+                "ok": bool(affected.get("ok")),
+                "output": cap_text(affected.get("failures") or affected.get("summary") or "", MAX_TOOL_CHARS),
+                "tia": {k: affected.get(k) for k in ("selected", "skipped_estimate", "runner")},
             })
-            if not tia.get("ok"):
+            if not affected.get("ok"):
                 blocked = True
     elif run_tests and full_gate and blocked:
         gates.append({"name": "tests", "skipped": True, "reason": "type/lint failed — fix those before tests"})

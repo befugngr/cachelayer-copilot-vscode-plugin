@@ -9,20 +9,22 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 try:
-    from .detect import detect
-    from .util import run_cmd, which
+    from .workspace_detect import detect, invalidate_detect
+    from .process_util import SKIP_PARTS, run_cmd, which
 except ImportError:
-    from detect import detect
-    from util import run_cmd, which
+    from workspace_detect import detect, invalidate_detect
+    from process_util import SKIP_PARTS, run_cmd, which
 
 JACOCO_VERSION = "0.8.13"
 STARTS_VERSION = "1.4"
 EKSTAZI_VERSION = "5.3.0"
 TOOLCHAIN = Path.home() / ".cache" / "cachelayer-toolchain"
+MAX_JACOCO_ARTIFACT_BYTES = 25_000_000
 
 
 def _bounded_java_env(heap_mb: int = 512) -> dict[str, str]:
@@ -37,16 +39,27 @@ def _bounded_java_env(heap_mb: int = 512) -> dict[str, str]:
 
 def _java_tests(root: Path) -> list[str]:
     result: list[str] = []
-    for marker in ("java", "kotlin"):
-        for base in root.glob(f"**/src/test/{marker}"):
-            if not base.is_dir():
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+        parts = Path(dirpath).relative_to(root).parts
+        if not any(
+            parts[index:index + 3] in (("src", "test", "java"), ("src", "test", "kotlin"))
+            for index in range(max(0, len(parts) - 2))
+        ):
+            continue
+        for name in filenames:
+            if not name.endswith(("Test.java", "Tests.java", "IT.java", "Test.kt", "Tests.kt", "IT.kt")):
                 continue
-            for pattern in ("*Test.java", "*Tests.java", "*IT.java", "*Test.kt", "*Tests.kt", "*IT.kt"):
-                for path in base.rglob(pattern):
-                    parts = list(path.with_suffix("").parts)
-                    value = ".".join(parts[parts.index(marker) + 1:]) if marker in parts else path.stem
-                    if value not in result:
-                        result.append(value)
+            visited += 1
+            path = Path(dirpath) / name
+            parts = list(path.with_suffix("").parts)
+            marker = "java" if "java" in parts else "kotlin"
+            value = ".".join(parts[parts.index(marker) + 1:])
+            if value not in result:
+                result.append(value)
+            if visited >= 4000:
+                return result
     return result
 
 
@@ -54,32 +67,80 @@ def _cache_key(root: Path) -> str:
     revision = run_cmd(
         ["git", "rev-parse", "HEAD"], cwd=root, timeout=5, memory_mb=None,
     ).get("output") or "working-tree"
-    raw = f"{root.resolve()}\0{str(revision).strip()}".encode()
+    dirty = run_cmd(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root, timeout=5, memory_mb=None,
+    ).get("output") or ""
+    diff = run_cmd(
+        ["git", "diff", "--binary", "HEAD", "--"], cwd=root,
+        timeout=8, memory_mb=None,
+    ).get("output") or ""
+    untracked = hashlib.sha256()
+    remaining = 2_000_000
+    for line in str(dirty).splitlines():
+        if not line.startswith("?? "):
+            continue
+        candidate = root / line[3:]
+        try:
+            candidate.resolve().relative_to(root.resolve())
+            if not candidate.is_file():
+                continue
+            untracked.update(line[3:].encode())
+            with candidate.open("rb") as stream:
+                chunk = stream.read(min(remaining, 256_000))
+            untracked.update(chunk)
+            remaining -= len(chunk)
+            if remaining <= 0:
+                break
+        except (OSError, ValueError):
+            continue
+    raw = (
+        f"{root.resolve()}\0{str(revision).strip()}\0{dirty[:200_000]}"
+        f"\0{diff[:2_000_000]}\0{untracked.hexdigest()}"
+    ).encode()
     return hashlib.sha256(raw).hexdigest()[:20]
 
 
 def jacoco_provenance(root: Path) -> dict[str, str]:
     """Fingerprint inputs which can change per-test coverage ownership."""
     digest = hashlib.sha256()
-    files: list[Path] = []
-    for name in (
+    input_names = {
         "pom.xml", "build.gradle", "build.gradle.kts",
         "settings.gradle", "settings.gradle.kts", "gradle.properties",
-    ):
-        files.extend(path for path in root.glob(f"**/{name}") if path.is_file())
-    for marker in ("src/main", "src/test"):
-        for base in root.glob(f"**/{marker}"):
-            if base.is_dir():
-                files.extend(
-                    path for path in base.rglob("*")
-                    if path.is_file() and path.suffix.lower() in {".java", ".kt", ".kts"}
-                )
+    }
+    files: list[Path] = []
+    entries = 0
+    deadline = time.monotonic() + 1.0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+        for name in filenames:
+            entries += 1
+            if entries > 20_000 or time.monotonic() > deadline:
+                break
+            path = Path(dirpath) / name
+            if name in input_names or path.suffix.lower() in {".java", ".kt", ".kts"}:
+                files.append(path)
+        if entries > 20_000 or time.monotonic() > deadline:
+            break
+    remaining_bytes = 25_000_000
     for path in sorted(set(files)):
         try:
             rel = path.relative_to(root).as_posix()
             digest.update(rel.encode())
             digest.update(b"\0")
-            digest.update(path.read_bytes())
+            size = path.stat().st_size
+            if size > remaining_bytes:
+                digest.update(f"oversize:{size}".encode())
+                remaining_bytes = 0
+                break
+            with path.open("rb") as stream:
+                while size:
+                    chunk = stream.read(min(size, 1024 * 1024))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size -= len(chunk)
+                    remaining_bytes -= len(chunk)
             digest.update(b"\0")
         except OSError:
             continue
@@ -103,13 +164,20 @@ def build_joern_cpg(root: Path, timeout: int = 300) -> dict[str, Any]:
         return {"ok": False, "available": False, "reason": "joern-parse is not installed"}
     output = joern_cpg_path(root)
     output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
     result = run_cmd(
-        [parser, str(root), "--language", "javasrc", "--output", str(output)],
+        [parser, str(root), "--language", "javasrc", "--output", str(temporary)],
         cwd=root, timeout=max(30, min(timeout, 900)), memory_mb=None,
         env=_bounded_java_env(1200),
     )
+    ok = bool(result.get("ok")) and temporary.is_file()
+    if ok:
+        temporary.replace(output)
+    else:
+        temporary.unlink(missing_ok=True)
     return {
-        "ok": bool(result.get("ok")) and output.is_file(),
+        "ok": ok and output.is_file(),
         "available": True,
         "artifact": str(output) if output.is_file() else None,
         "summary": result.get("output", "")[-1000:],
@@ -119,6 +187,24 @@ def build_joern_cpg(root: Path, timeout: int = 300) -> dict[str, Any]:
 
 def _safe_test_name(test: str) -> str:
     return test.replace("$", "_").replace(".", "__").replace("#", "__")
+
+
+def _named_artifact_dirs(root: Path, name: str, limit: int = 50) -> list[Path]:
+    found: list[Path] = []
+    visited = 0
+    for dirpath, dirnames, _ in os.walk(root, followlinks=False):
+        visited += 1
+        if visited > 4000:
+            break
+        current = Path(dirpath)
+        if current.name == name:
+            found.append(current)
+            dirnames[:] = []
+            if len(found) >= limit:
+                break
+            continue
+        dirnames[:] = [child for child in dirnames if child not in SKIP_PARTS]
+    return found
 
 
 def _jacoco_cli(root: Path, mvn: str | None, timeout: int) -> Path | None:
@@ -180,16 +266,48 @@ def _jacoco_report_from_exec(
 
 def _write_jacoco_manifest(
     root: Path, destination: Path, entries: dict[str, dict[str, str]],
+    expected_tests: int,
 ) -> Path:
     manifest = destination / "manifest.json"
     payload = {
         "schema": "cachelayer-jacoco-per-test-v1",
         "jacoco_version": JACOCO_VERSION,
         "provenance": jacoco_provenance(root),
+        "complete": True,
+        "expected_tests": expected_tests,
         "tests": entries,
     }
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = manifest.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(manifest)
     return manifest
+
+
+def _bounded_sha256(path: Path) -> str:
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_JACOCO_ARTIFACT_BYTES:
+        raise ValueError(f"artifact size {size} is outside the allowed bound")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        remaining = MAX_JACOCO_ARTIFACT_BYTES + 1
+        while remaining > 0:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _jacoco_manifest_entry(root: Path, exec_file: Path, xml_file: Path) -> dict[str, str]:
+    return {
+        "exec": exec_file.relative_to(root).as_posix(),
+        "xml": xml_file.relative_to(root).as_posix(),
+        "exec_sha256": _bounded_sha256(exec_file),
+        "xml_sha256": _bounded_sha256(xml_file),
+    }
 
 
 def seed_jacoco_per_test(
@@ -208,6 +326,11 @@ def seed_jacoco_per_test(
     diagnostics: dict[str, str] = {}
     reports = 0
     entries: dict[str, dict[str, str]] = {}
+    deadline = time.monotonic() + max(1, timeout)
+
+    def remaining() -> int:
+        return max(1, int(deadline - time.monotonic()))
+
     mvn = info.get("tools", {}).get("mvn")
     cli = _jacoco_cli(root, mvn, timeout)
     if not cli:
@@ -220,7 +343,12 @@ def seed_jacoco_per_test(
             return {"ok": False, "reason": "Maven is unavailable"}
         destination = root / "target" / "jacoco" / "per-test"
         exec_dir = root / "target" / "jacoco" / "per-test-exec"
-        for test in tests:
+        (destination / "manifest.json").unlink(missing_ok=True)
+        for index, test in enumerate(tests):
+            if time.monotonic() >= deadline:
+                failures.extend(tests[index:])
+                diagnostics[test] = "global JaCoCo baseline deadline exhausted"
+                break
             safe = _safe_test_name(test)
             exec_file = exec_dir / f"{safe}.exec"
             xml_file = destination / f"session_{safe}.xml"
@@ -234,31 +362,35 @@ def seed_jacoco_per_test(
                     f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}:prepare-agent",
                     "test",
                 ],
-                cwd=root, timeout=timeout, memory_mb=None,
+                cwd=root, timeout=remaining(), memory_mb=None,
                 env=_bounded_java_env(),
             )
             report = (
-                _jacoco_report_from_exec(root, exec_file, xml_file, cli, timeout)
+                _jacoco_report_from_exec(root, exec_file, xml_file, cli, remaining())
                 if result.get("ok") else result
             )
             if not report.get("ok"):
                 failures.append(test)
                 diagnostics[test] = str(report.get("output") or "")[-1000:]
             else:
-                reports += 1
-                entries[test] = {
-                    "exec": exec_file.relative_to(root).as_posix(),
-                    "xml": xml_file.relative_to(root).as_posix(),
-                    "exec_sha256": hashlib.sha256(exec_file.read_bytes()).hexdigest(),
-                    "xml_sha256": hashlib.sha256(xml_file.read_bytes()).hexdigest(),
-                }
+                try:
+                    entries[test] = _jacoco_manifest_entry(root, exec_file, xml_file)
+                    reports += 1
+                except (OSError, ValueError) as exc:
+                    failures.append(test)
+                    diagnostics[test] = str(exc)
     elif info.get("gradle"):
         gradle = info["tools"].get("gradle")
         if not gradle:
             return {"ok": False, "reason": "Gradle is unavailable"}
         destination = root / "build" / "jacoco" / "per-test"
         exec_dir = root / "build" / "jacoco" / "per-test-exec"
-        for test in tests:
+        (destination / "manifest.json").unlink(missing_ok=True)
+        for index, test in enumerate(tests):
+            if time.monotonic() >= deadline:
+                failures.extend(tests[index:])
+                diagnostics[test] = "global JaCoCo baseline deadline exhausted"
+                break
             safe = _safe_test_name(test)
             exec_file = exec_dir / f"{safe}.exec"
             xml_file = destination / f"session_{safe}.xml"
@@ -286,37 +418,40 @@ allprojects {
                         gradle, "--no-daemon", "-q", "-I", str(init_script),
                         f"-Dcachelayer.jacoco.dest={exec_file}", "test", "--tests", test,
                     ],
-                    cwd=root, timeout=timeout, memory_mb=None,
+                    cwd=root, timeout=remaining(), memory_mb=None,
                     env=_bounded_java_env(),
                 )
             finally:
                 init_script.unlink(missing_ok=True)
             report = (
-                _jacoco_report_from_exec(root, exec_file, xml_file, cli, timeout)
+                _jacoco_report_from_exec(root, exec_file, xml_file, cli, remaining())
                 if result.get("ok") else result
             )
             if not report.get("ok"):
                 failures.append(test)
                 diagnostics[test] = str(report.get("output") or "")[-1000:]
             else:
-                reports += 1
-                entries[test] = {
-                    "exec": exec_file.relative_to(root).as_posix(),
-                    "xml": xml_file.relative_to(root).as_posix(),
-                    "exec_sha256": hashlib.sha256(exec_file.read_bytes()).hexdigest(),
-                    "xml_sha256": hashlib.sha256(xml_file.read_bytes()).hexdigest(),
-                }
+                try:
+                    entries[test] = _jacoco_manifest_entry(root, exec_file, xml_file)
+                    reports += 1
+                except (OSError, ValueError) as exc:
+                    failures.append(test)
+                    diagnostics[test] = str(exc)
     else:
         return {"ok": False, "reason": "no Maven or Gradle project detected"}
-    manifest = _write_jacoco_manifest(root, destination, entries)
+    complete = not failures and reports == len(tests) and len(entries) == len(tests)
+    manifest = (
+        _write_jacoco_manifest(root, destination, entries, len(tests))
+        if complete else None
+    )
     return {
-        "ok": not failures and reports == len(tests),
+        "ok": complete,
         "tests": len(tests),
         "reports": reports,
         "failures": failures[:50],
         "diagnostics": diagnostics,
         "artifact": str(destination),
-        "manifest": str(manifest),
+        "manifest": str(manifest) if manifest is not None else None,
         "source": "jacoco-explicit-per-test-baseline",
     }
 
@@ -327,6 +462,7 @@ def seed_native_rts(
     if not info.get("maven") or not info["tools"].get("mvn"):
         return {"ok": False, "reason": f"{kind} baseline currently requires Maven"}
     mvn = info["tools"]["mvn"]
+    deadline = time.monotonic() + max(1, timeout)
     if kind == "starts":
         argv = [
             mvn, "-q", "-DfailIfNoTests=false",
@@ -338,11 +474,11 @@ def seed_native_rts(
             f"org.ekstazi:ekstazi-maven-plugin:{EKSTAZI_VERSION}:select", "test",
         ]
     result = run_cmd(
-        argv, cwd=root, timeout=timeout, memory_mb=None,
+        argv, cwd=root, timeout=max(1, int(deadline - time.monotonic())),
         env=_bounded_java_env(),
     )
     artifact = ".starts" if kind == "starts" else ".ekstazi"
-    locations = [str(path) for path in root.glob(f"**/{artifact}") if path.is_dir()]
+    locations = [str(path) for path in _named_artifact_dirs(root, artifact)]
     if kind == "ekstazi" and not locations:
         core = (
             Path.home() / ".m2" / "repository" / "org" / "ekstazi"
@@ -350,12 +486,18 @@ def seed_native_rts(
             / f"org.ekstazi.core-{EKSTAZI_VERSION}.jar"
         )
         if not core.is_file():
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False, "runner": "ekstazi-baseline",
+                    "artifacts": [], "summary": "global preparation deadline exhausted",
+                }
             fetched = run_cmd(
                 [
                     mvn, "-q", "dependency:get",
                     f"-Dartifact=org.ekstazi:org.ekstazi.core:{EKSTAZI_VERSION}",
                 ],
-                cwd=root, timeout=timeout, memory_mb=None, env=_bounded_java_env(),
+                cwd=root, timeout=max(1, int(deadline - time.monotonic())),
+                memory_mb=None, env=_bounded_java_env(),
             )
             if not fetched.get("ok"):
                 return {
@@ -367,11 +509,17 @@ def seed_native_rts(
             f"-javaagent:{core}=mode=JUNITFORK,force.all=true,"
             f"root.dir={root_uri}"
         )
+        if time.monotonic() >= deadline:
+            return {
+                "ok": False, "runner": "ekstazi-baseline",
+                "artifacts": [], "summary": "global preparation deadline exhausted",
+            }
         result = run_cmd(
             [mvn, "-q", "-DfailIfNoTests=false", f"-DargLine={agent}", "test"],
-            cwd=root, timeout=timeout, memory_mb=None, env=_bounded_java_env(),
+            cwd=root, timeout=max(1, int(deadline - time.monotonic())),
+            memory_mb=None, env=_bounded_java_env(),
         )
-        locations = [str(path) for path in root.glob("**/.ekstazi") if path.is_dir()]
+        locations = [str(path) for path in _named_artifact_dirs(root, ".ekstazi")]
     return {
         "ok": bool(result.get("ok")) and bool(locations),
         "runner": f"{kind}-baseline",
@@ -411,19 +559,35 @@ def prepare_tia(
         }
     max_tests = max(1, min(int(max_tests), 1000))
     timeout = max(30, min(int(timeout), 900))
+    deadline = time.monotonic() + timeout
     steps: dict[str, Any] = {}
+    def remaining() -> int:
+        return max(1, int(deadline - time.monotonic()))
+
     if mode in {"jacoco", "all"}:
         steps["jacoco"] = seed_jacoco_per_test(
-            root, info, max_tests=max_tests, timeout=timeout,
+            root, info, max_tests=max_tests, timeout=remaining(),
         )
     if mode in {"starts", "all"}:
-        steps["starts"] = seed_native_rts(root, info, "starts", timeout)
+        if time.monotonic() >= deadline:
+            steps["starts"] = {"ok": False, "reason": "global preparation deadline exhausted"}
+        else:
+            steps["starts"] = seed_native_rts(root, info, "starts", remaining())
     if mode in {"ekstazi", "all"}:
-        steps["ekstazi"] = seed_native_rts(root, info, "ekstazi", timeout)
+        if time.monotonic() >= deadline:
+            steps["ekstazi"] = {"ok": False, "reason": "global preparation deadline exhausted"}
+        else:
+            steps["ekstazi"] = seed_native_rts(root, info, "ekstazi", remaining())
     if mode in {"joern", "all"}:
-        steps["joern"] = build_joern_cpg(root, timeout)
+        if time.monotonic() >= deadline:
+            steps["joern"] = {"ok": False, "reason": "global preparation deadline exhausted"}
+        else:
+            steps["joern"] = build_joern_cpg(root, remaining())
+    ok = bool(steps) and all(step.get("ok") for step in steps.values())
+    if ok:
+        invalidate_detect()
     return {
-        "ok": bool(steps) and all(step.get("ok") for step in steps.values()),
+        "ok": ok,
         "runner": "tia-prepare",
         "mode": mode,
         "steps": steps,

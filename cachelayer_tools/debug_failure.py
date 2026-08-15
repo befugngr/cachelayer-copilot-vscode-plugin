@@ -8,17 +8,18 @@ import math
 import os
 import re
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 try:
-    from .detect import detect
-    from .util import cap_text, run_cmd, which
+    from .workspace_detect import detect
+    from .process_util import cap_text, run_cmd, which
 except ImportError:
-    from detect import detect
-    from util import cap_text, run_cmd, which
+    from workspace_detect import detect
+    from process_util import cap_text, run_cmd, which
 
 # file:line from Python/JS/Java traces
 _FRAME_RE = re.compile(
@@ -358,13 +359,18 @@ def _joern_statements(payload: str, target_file: str, target_line: int) -> list[
     return [f"{name}:{number}| {code}" for name, number, code in found[:100]]
 
 
-def ochiai(failed_cov: dict[tuple[str, int], int], passed_cov: dict[tuple[str, int], int]) -> list[dict[str, Any]]:
+def ochiai(
+    failed_cov: dict[tuple[str, int], int],
+    passed_cov: dict[tuple[str, int], int],
+    total_failed: int | None = None,
+) -> list[dict[str, Any]]:
     keys = set(failed_cov) | set(passed_cov)
+    total_failed = max(1, int(total_failed or max(failed_cov.values(), default=1)))
     ranked = []
     for k in keys:
         f = failed_cov.get(k, 0)
         p = passed_cov.get(k, 0)
-        den = math.sqrt(f * (f + p)) or 1.0
+        den = math.sqrt(total_failed * (f + p)) or 1.0
         score = f / den
         ranked.append({"file": k[0], "line": k[1], "ochiai": round(score, 4)})
     ranked.sort(key=lambda x: x["ochiai"], reverse=True)
@@ -425,7 +431,7 @@ def ochiai_from_coverage(
                 normalized = {c.split("|", 1)[0].split("[", 1)[0] for c in line_contexts if c}
                 failing = {
                     c for c in normalized
-                    if any(fid == c or fid in c or c in fid for fid in failed_ids)
+                    if c in failed_ids
                 }
                 passing = normalized - failing
                 matched.update(failing)
@@ -444,7 +450,7 @@ def ochiai_from_coverage(
             "method": "coverage-context-matrix",
             "failed_tests": len(matched),
             "passed_tests": len(contexts - matched),
-            "ranked": ochiai(failed_cov, passed_cov),
+            "ranked": ochiai(failed_cov, passed_cov, total_failed=len(matched)),
         }
     except Exception as exc:
         return {
@@ -479,9 +485,8 @@ def generate_python_ochiai(
             "reason": "no local failing pytest file parsed from output",
         }
 
-    data_file = root / ".cachelayer-debug-coverage"
-    try:
-        data_file.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cachelayer-debug-coverage-") as temp:
+        data_file = Path(temp) / ".coverage"
         result = run_cmd(
             [
                 python, "-m", "pytest", "-q", "--tb=line",
@@ -500,8 +505,6 @@ def generate_python_ochiai(
         if not ranked.get("available") and result.get("output"):
             ranked["diagnostic"] = cap_text(result["output"], 600)
         return ranked
-    finally:
-        data_file.unlink(missing_ok=True)
 
 
 def _parse_fault_locations(text: str) -> list[dict[str, Any]]:
@@ -530,10 +533,15 @@ def java_fault_localization(
     info: dict[str, Any],
     timeout: int = 45,
 ) -> dict[str, Any]:
-    """Run a configured Flacoco CLI or jar and parse suspicious locations."""
+    """Run Flacoco when configured. GZoltar may be detected but is not executed here."""
     exe = info["tools"].get("flacoco")
-    jar = os.environ.get("FLACOCO_JAR", "")
+    jar = (
+        os.environ.get("FLACOCO_JAR", "").strip()
+        or info["tools"].get("flacoco_jar")
+        or ""
+    )
     java = info["tools"].get("java")
+    gzoltar = info["tools"].get("gzoltar")
     if exe:
         prefix = [exe]
     elif jar and Path(jar).is_file() and java:
@@ -541,8 +549,14 @@ def java_fault_localization(
     else:
         return {
             "available": False,
+            "executed": False,
             "method": "flacoco",
-            "install": "Put flacoco on PATH or set FLACOCO_JAR to its standalone jar.",
+            "gzoltar_detected": bool(gzoltar),
+            "gzoltar_executed": False,
+            "install": (
+                "Put flacoco on PATH or set FLACOCO_JAR to its standalone jar."
+                + (" GZoltar is on PATH but CacheLayer does not invoke it yet." if gzoltar else "")
+            ),
         }
     help_result = run_cmd([*prefix, "--help"], cwd=root, timeout=8)
     help_text = help_result.get("output") or ""
@@ -555,11 +569,12 @@ def java_fault_localization(
             "available": True,
             "executed": False,
             "method": "flacoco",
+            "gzoltar_detected": bool(gzoltar),
+            "gzoltar_executed": False,
             "reason": "installed CLI has no supported --projectpath adapter",
         }
-    output_file = root / ".cachelayer-flacoco.csv"
-    try:
-        output_file.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cachelayer-flacoco-") as temp:
+        output_file = Path(temp) / "flacoco.csv"
         result = run_cmd(
             [
                 *prefix, project_flag, str(root),
@@ -578,13 +593,13 @@ def java_fault_localization(
             "available": True,
             "executed": True,
             "method": "flacoco",
+            "gzoltar_detected": bool(gzoltar),
+            "gzoltar_executed": False,
             "ok": bool(result.get("ok")),
             "timeout": bool(result.get("timeout")),
             "ranked": hits,
             "diagnostic": cap_text(result.get("output") or "", 500) if not hits else "",
         }
-    finally:
-        output_file.unlink(missing_ok=True)
 
 
 def ddmin(s: str, pred, max_rounds: int = 12) -> str:
@@ -771,9 +786,16 @@ def minimize_with_repro(
     argv = repro.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
         return failing_input, {"applied": False, "reason": "repro.argv must be a string array"}
-    max_runs = max(1, min(int(repro.get("max_runs") or 30), 50))
-    timeout = max(1, min(int(repro.get("timeout") or 5), 15))
+    max_runs = max(1, min(int(repro.get("max_runs") or 20), 30))
+    timeout = max(1, min(int(repro.get("timeout") or 5), 8))
     pattern = str(repro.get("failure_pattern") or "")
+    if len(pattern) > 500:
+        return failing_input, {"applied": False, "reason": "failure_pattern exceeds 500 characters"}
+    try:
+        failure_re = re.compile(pattern) if pattern else None
+    except re.error:
+        return failing_input, {"applied": False, "reason": "failure_pattern is invalid"}
+    deadline = time.monotonic() + min(60, max_runs * timeout)
 
     with tempfile.TemporaryDirectory(prefix=".cachelayer-repro-", dir=root) as temp:
         input_path = Path(temp) / "input.txt"
@@ -783,7 +805,7 @@ def minimize_with_repro(
             last_output = ""
 
             def __call__(self, candidate: str) -> bool:
-                if self.runs >= max_runs:
+                if self.runs >= max_runs or time.monotonic() >= deadline:
                     return False
                 self.runs += 1
                 input_path.write_text(candidate, encoding="utf-8")
@@ -797,11 +819,8 @@ def minimize_with_repro(
                 )
                 self.last_output = result.get("output") or ""
                 failed = result.get("code") not in (0, None)
-                if pattern:
-                    try:
-                        return failed and re.search(pattern, self.last_output) is not None
-                    except re.error:
-                        return False
+                if failure_re:
+                    return failed and failure_re.search(self.last_output) is not None
                 return failed
 
         interesting = Interesting()
@@ -882,8 +901,11 @@ def debug_failure(
     }
     java_sbfl: dict[str, Any] = {
         "available": False,
-        "method": "flacoco/gzoltar",
+        "executed": False,
+        "method": "none",
         "reason": "not a Java failure",
+        "gzoltar_detected": bool(info["tools"].get("gzoltar")),
+        "gzoltar_executed": False,
     }
     if crash:
         f, ln = crash["file"], int(crash["line"])
@@ -934,12 +956,12 @@ def debug_failure(
             not ochiai_result.get("available")
             and auto_coverage
             and info.get("python")
-            and info["tools"].get("python3")
+            and (info["tools"].get("analysis-python") or info["tools"].get("python3"))
         ):
             ochiai_result = generate_python_ochiai(
                 root,
                 blob,
-                info["tools"]["python3"],
+                info["tools"].get("analysis-python") or info["tools"]["python3"],
                 timeout,
             )
 
@@ -990,7 +1012,15 @@ def debug_failure(
                 slice_info and slice_info.get("method") == "ast-def-use-backward"
             ),
             "ast_slice": bool(slice_info and slice_info.get("method") == "ast-enclosing"),
-            "flacoco_or_gzoltar": bool(java_sbfl.get("executed")),
+            "flacoco": bool(
+                java_sbfl.get("executed") and java_sbfl.get("method") == "flacoco"
+            ),
+            "gzoltar": bool(java_sbfl.get("gzoltar_executed")),
+            "gzoltar_detected": bool(java_sbfl.get("gzoltar_detected")),
+            # Backward-compatible alias: true only when Flacoco actually ran.
+            "flacoco_or_gzoltar": bool(
+                java_sbfl.get("executed") and java_sbfl.get("method") == "flacoco"
+            ),
         },
         "next": "Use this blob for one fix at suggested_fix_location, then call verify_edit once. Do not call debug_failure a second time.",
     }

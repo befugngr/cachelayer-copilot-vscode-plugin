@@ -3,23 +3,27 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import sqlite3
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 try:
-    from .tia_prepare import build_joern_cpg, jacoco_provenance, joern_cpg_path
-    from .util import SKIP_PARTS, run_cmd
+    from .test_baselines import jacoco_provenance, joern_cpg_path
+    from .process_util import SKIP_PARTS, run_cmd
 except ImportError:
-    from tia_prepare import build_joern_cpg, jacoco_provenance, joern_cpg_path
-    from util import SKIP_PARTS, run_cmd
+    from test_baselines import jacoco_provenance, joern_cpg_path
+    from process_util import SKIP_PARTS, run_cmd
 
 MAX_SCAN_FILES = 4000
 MAX_TESTS = 50
 MAX_SQL_PARAMS = 200
+MAX_MANIFEST_BYTES = 1_000_000
+MAX_JACOCO_ARTIFACT_BYTES = 25_000_000
 _READ = {"encoding": "utf-8", "errors": "ignore"}
 
 _JACOCO_REPORTS = (
@@ -54,14 +58,110 @@ _JOERN_OUTPUTS = (
 
 def _walk(root: Path, suffixes: tuple[str, ...], limit: int = MAX_SCAN_FILES) -> list[Path]:
     found: list[Path] = []
-    for path in root.rglob("*"):
-        if len(found) >= limit:
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() in suffixes:
+                found.append(path)
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def _confined_file(root: Path, raw: Any) -> Path | None:
+    value = str(raw or "")
+    relative = Path(value)
+    if not value or relative.is_absolute() or ".." in relative.parts:
+        return None
+    try:
+        resolved = (root / relative).resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved
+
+
+def _bounded_sha256(path: Path) -> str | None:
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_JACOCO_ARTIFACT_BYTES:
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            remaining = size
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    return None
+                digest.update(chunk)
+                remaining -= len(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _artifact_is_fresh(root: Path, artifact: Path) -> bool:
+    """Require an artifact newer than a bounded scan of relevant project inputs."""
+    try:
+        artifact_mtime = artifact.stat().st_mtime_ns
+    except OSError:
+        return False
+    seen = 0
+    deadline = time.monotonic() + 0.2
+    input_names = {
+        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+        "settings.gradle.kts", "package.json", "pytest.ini", "pyproject.toml",
+    }
+    suffixes = {".py", ".pyi", ".java", ".kt", ".kts", ".js", ".jsx", ".ts", ".tsx"}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+        for name in filenames:
+            if name not in input_names and Path(name).suffix.lower() not in suffixes:
+                continue
+            seen += 1
+            if seen > MAX_SCAN_FILES or time.monotonic() > deadline:
+                return False
+            try:
+                if (Path(dirpath) / name).stat().st_mtime_ns > artifact_mtime:
+                    return False
+            except OSError:
+                return False
+    return True
+
+
+def _named_dirs(root: Path, wanted: str, limit: int = 20) -> list[Path]:
+    found: list[Path] = []
+    visited = 0
+    for dirpath, dirnames, _ in os.walk(root, followlinks=False):
+        visited += 1
+        if visited > MAX_SCAN_FILES:
             break
-        if path.suffix.lower() not in suffixes or not path.is_file():
+        current = Path(dirpath)
+        if current.name == wanted:
+            found.append(current)
+            dirnames[:] = []
+            if len(found) >= limit:
+                break
             continue
-        if set(path.relative_to(root).parts) & SKIP_PARTS:
-            continue
-        found.append(path)
+        dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+    return found
+
+
+def _artifact_files(root: Path, limit: int = MAX_SCAN_FILES) -> list[Path]:
+    found: list[Path] = []
+    entries = 0
+    deadline = time.monotonic() + 0.4
+    allowed_build = {"build", "target"}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames if name not in (SKIP_PARTS - allowed_build)
+        ]
+        for name in filenames:
+            entries += 1
+            if entries > limit or time.monotonic() > deadline:
+                return found
+            found.append(Path(dirpath) / name)
     return found
 
 
@@ -69,26 +169,33 @@ def smart_test_picker_map(root: Path) -> str | None:
     """Return a configured per-test JaCoCo map without searching build trees unboundedly."""
     for rel in _SMART_MAPS:
         path = root / rel
-        if path.is_file():
+        if path.is_file() and _artifact_is_fresh(root, path):
             return rel
-    for base_name in ("build", "target"):
-        base = root / base_name
-        if not base.is_dir():
-            continue
-        for path in base.glob("**/*coverage*map*.json"):
-            if path.is_file():
-                return path.relative_to(root).as_posix()
+    for path in _artifact_files(root):
+        lowered = path.name.lower()
+        if (
+            path.suffix == ".json" and "coverage" in lowered and "map" in lowered
+            and _artifact_is_fresh(root, path)
+        ):
+            return path.relative_to(root).as_posix()
     return None
 
 
 def smart_test_picker_selection(root: Path) -> dict[str, Any] | None:
     """Read the selector's explicit output after a Smart Test Picker run."""
-    path = next((root / rel for rel in _SMART_SELECTIONS if (root / rel).is_file()), None)
+    path = next((
+        root / rel for rel in _SMART_SELECTIONS
+        if (root / rel).is_file() and _artifact_is_fresh(root, root / rel)
+    ), None)
     if path is None:
-        candidates: list[Path] = []
-        for build_dir in ("build", "target"):
-            candidates.extend(root.glob(f"**/{build_dir}/selected-tests.json"))
-        path = next((candidate for candidate in candidates[:200] if candidate.is_file()), None)
+        candidates = [
+            candidate for candidate in _artifact_files(root)
+            if candidate.name == "selected-tests.json"
+        ]
+        path = next((
+            candidate for candidate in candidates[:200]
+            if candidate.is_file() and _artifact_is_fresh(root, candidate)
+        ), None)
     if path is None:
         return None
     try:
@@ -107,7 +214,8 @@ def smart_test_picker_selection(root: Path) -> dict[str, Any] | None:
         "status": payload.get("status"),
         "reason": payload.get("reason"),
         "tests": tests[:MAX_TESTS],
-        "selected": len(tests),
+        "selected": min(len(tests), MAX_TESTS),
+        "selection_incomplete": len(tests) > MAX_TESTS,
         "total": total,
         "skipped_estimate": max(0, total - len(tests)) if total is not None else None,
         "file": path.relative_to(root).as_posix(),
@@ -154,9 +262,16 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
     manifests: list[str] = []
     rejected: list[str] = []
     entries: list[tuple[str, Path]] = []
-    for pattern in _PER_TEST_JACOCO_MANIFESTS:
-        for manifest in list(root.glob(pattern))[:20]:
+    manifest_candidates = [
+        path for path in _artifact_files(root)
+        if path.name == "manifest.json"
+        and "jacoco" in {part.lower() for part in path.parts}
+        and any(part.lower() in {"per-test", "jacoco-per-test"} for part in path.parts)
+    ][:20]
+    for manifest in manifest_candidates:
             try:
+                if manifest.stat().st_size > MAX_MANIFEST_BYTES:
+                    raise ValueError("manifest exceeds size bound")
                 payload = json.loads(manifest.read_text(**_READ))
             except (OSError, ValueError):
                 rejected.append(f"{manifest.relative_to(root).as_posix()}: unreadable manifest")
@@ -164,7 +279,9 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
             if (
                 payload.get("schema") != "cachelayer-jacoco-per-test-v1"
                 or payload.get("provenance") != current_provenance
+                or payload.get("complete") is not True
                 or not isinstance(payload.get("tests"), dict)
+                or payload.get("expected_tests") != len(payload.get("tests", {}))
             ):
                 rejected.append(f"{manifest.relative_to(root).as_posix()}: stale or unknown manifest")
                 continue
@@ -172,22 +289,25 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
             for test, item in list(payload["tests"].items())[:200]:
                 if not isinstance(item, dict):
                     continue
-                exec_file = root / str(item.get("exec") or "")
-                xml_file = root / str(item.get("xml") or "")
-                try:
-                    valid = (
-                        exec_file.is_file() and xml_file.is_file()
-                        and hashlib.sha256(exec_file.read_bytes()).hexdigest() == item.get("exec_sha256")
-                        and hashlib.sha256(xml_file.read_bytes()).hexdigest() == item.get("xml_sha256")
-                    )
-                except OSError:
-                    valid = False
+                exec_file = _confined_file(root, item.get("exec"))
+                xml_file = _confined_file(root, item.get("xml"))
+                valid = bool(
+                    exec_file is not None and xml_file is not None
+                    and exec_file.is_file() and xml_file.is_file()
+                    and _bounded_sha256(exec_file) == item.get("exec_sha256")
+                    and _bounded_sha256(xml_file) == item.get("xml_sha256")
+                )
                 if valid:
+                    assert xml_file is not None
                     entries.append((str(test).split("#", 1)[0], xml_file))
                 else:
-                    rejected.append(f"{test}: missing or hash-mismatched exec/XML pair")
+                    rejected.append(
+                        f"{test}: unsafe, oversized, missing, or hash-mismatched exec/XML pair"
+                    )
     for test, path in entries:
         try:
+            if path.stat().st_size > MAX_JACOCO_ARTIFACT_BYTES:
+                raise OSError("report exceeds size bound")
             report = ET.parse(path).getroot()
         except (ET.ParseError, OSError):
             continue
@@ -208,8 +328,9 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
                 tests.append(test)
     exec_files = [
         path.relative_to(root).as_posix()
-        for path in list(root.glob("**/jacoco*.exec"))[:50] if path.is_file()
-    ]
+        for path in _artifact_files(root)
+        if path.name.startswith("jacoco") and path.suffix == ".exec"
+    ][:50]
     if not parsed:
         reason = "no fresh manifest-labeled per-test JaCoCo exec/XML pairs"
         if exec_files:
@@ -223,6 +344,7 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
     return {
         "available": True,
         "tests": tests[:MAX_TESTS],
+        "selection_incomplete": len(tests) > MAX_TESTS,
         "reports": parsed[:200],
         "manifests": manifests,
         "rejected": rejected[:50],
@@ -247,7 +369,7 @@ def starts_selected_tests(output: str) -> list[str]:
         if re.fullmatch(r"(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)", line):
             if line not in tests:
                 tests.append(line)
-    return tests[:MAX_TESTS]
+    return tests
 
 
 def ekstazi_non_affected_tests(output: str) -> list[str]:
@@ -272,6 +394,8 @@ def native_rts_selection(
     if kind == "starts":
         selected_tests = starts_selected_tests(selector_output)
         if selected_tests or "AffectedTests" in selector_output:
+            incomplete = len(selected_tests) > MAX_TESTS
+            selected_tests = selected_tests[:MAX_TESTS]
             selected = len(selected_tests)
             return {
                 "available": True,
@@ -283,11 +407,13 @@ def native_rts_selection(
                 ),
                 "artifacts": [],
                 "source": "starts-select-goal",
+                "selection_incomplete": incomplete,
             }
     elif selector_output and inventory is not None:
         non_affected = set(ekstazi_non_affected_tests(selector_output))
         if non_affected or "NonAffected::" in selector_output:
             selected_tests = [test for test in inventory if test not in non_affected]
+            incomplete = len(selected_tests) > MAX_TESTS
             selected_tests = selected_tests[:MAX_TESTS]
             return {
                 "available": True,
@@ -296,31 +422,40 @@ def native_rts_selection(
                 "skipped_estimate": len(non_affected),
                 "artifacts": [],
                 "source": "ekstazi-predict-goal",
+                "selection_incomplete": incomplete,
             }
 
     base_name = ".starts" if kind == "starts" else ".ekstazi"
-    bases = [path for path in root.glob(f"**/{base_name}") if path.is_dir()][:20]
+    bases = [
+        path for path in _named_dirs(root, base_name)
+        if _artifact_is_fresh(root, path)
+    ]
     tests: list[str] = []
     files: list[str] = []
     test_re = re.compile(r"\b(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)(?:#[\w$]+)?\b")
     for base in bases:
-        for path in list(base.rglob("*"))[:1000]:
-            if not path.is_file():
-                continue
-            files.append(path.relative_to(root).as_posix())
-            names = test_re.findall(path.name.replace("-", "."))
-            if path.stat().st_size <= 256_000:
-                try:
-                    names.extend(test_re.findall(path.read_text(**_READ)))
-                except OSError:
-                    pass
-            for name in names:
-                value = name.split("#", 1)[0].removesuffix(".clz")
-                if value not in tests:
-                    tests.append(value)
-                if len(tests) >= MAX_TESTS:
+        visited = 0
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name not in SKIP_PARTS]
+            for name in filenames:
+                visited += 1
+                if visited > 1000:
                     break
-            if len(tests) >= MAX_TESTS:
+                path = Path(dirpath) / name
+                files.append(path.relative_to(root).as_posix())
+                names = test_re.findall(path.name.replace("-", "."))
+                if path.stat().st_size <= 256_000:
+                    try:
+                        names.extend(test_re.findall(path.read_text(**_READ)))
+                    except OSError:
+                        pass
+                for candidate in names:
+                    value = candidate.split("#", 1)[0].removesuffix(".clz")
+                    if value not in tests:
+                        tests.append(value)
+                    if len(tests) >= MAX_TESTS:
+                        break
+            if len(tests) >= MAX_TESTS or visited > 1000:
                 break
     selected = len(tests) if tests else None
     return {
@@ -333,6 +468,7 @@ def native_rts_selection(
         ),
         "artifacts": files[:100],
         "source": f"{kind}-native-artifacts" if tests else f"{kind}-report-diff-fallback",
+        "selection_incomplete": len(files) >= 1000 or len(tests) >= MAX_TESTS,
     }
 
 
@@ -410,14 +546,86 @@ def rts_seed_plan(root: Path, info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _joern_record_kind(record: Any) -> str | None:
+    """Classify a Joern/legacy slice record; unknown schemas are rejected."""
+    if not isinstance(record, dict):
+        return None
+    if "callers" in record and ("target" in record or "callee" in record):
+        return "legacy-callers"
+    if any(key in record for key in ("objectSlices", "userDefinedTypes", "programUsageSlice")):
+        return "program-usage-slice"
+    if "nodes" in record and "edges" in record:
+        return "data-flow-slice"
+    if any(key in record for key in ("variable", "definedBy", "usedAt", "fileName", "lineNumber")):
+        return "program-usage-slice"
+    return None
+
+
+def _joern_tests_from_record(record: dict[str, Any], changed_symbols: set[str]) -> list[str]:
+    tests: list[str] = []
+    kind = _joern_record_kind(record)
+    if kind is None:
+        return tests
+
+    def _consider(name: str) -> None:
+        if not re.fullmatch(r"(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)", name):
+            return
+        if name not in tests:
+            tests.append(name)
+
+    if kind == "legacy-callers":
+        target = str(record.get("target") or record.get("callee") or "")
+        if changed_symbols and not any(symbol in target for symbol in changed_symbols):
+            # Still allow callers when the target string embeds a changed type.
+            blob = target
+            if not any(symbol in blob for symbol in changed_symbols):
+                return tests
+        for caller in record.get("callers") or []:
+            if isinstance(caller, str):
+                # Prefer the owning type/FQN before the method suffix.
+                owner = caller.rsplit(".", 1)[0] if "." in caller else caller
+                _consider(owner if owner.endswith(("Test", "Tests", "IT")) else caller)
+        return tests
+
+    # Structured Joern slices: collect candidate strings from known fields only.
+    candidates: list[str] = []
+    for key in ("fileName", "filename", "name", "fullName", "methodFullName", "typeFullName"):
+        value = record.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+    for key in ("nodes", "objectSlices", "definedBy", "usedAt"):
+        value = record.get(key)
+        if isinstance(value, list):
+            for item in value[:200]:
+                if isinstance(item, dict):
+                    for nested in ("name", "fullName", "methodFullName", "fileName", "filename"):
+                        nested_value = item.get(nested)
+                        if isinstance(nested_value, str):
+                            candidates.append(nested_value)
+                elif isinstance(item, str):
+                    candidates.append(item)
+    blob = "\n".join(candidates)
+    if changed_symbols and not any(symbol in blob for symbol in changed_symbols):
+        return tests
+    for candidate in candidates:
+        stem = Path(candidate).stem if "/" in candidate or "\\" in candidate else candidate
+        owner = stem.rsplit(".", 1)[0] if "." in stem and not stem.endswith(("Test", "Tests", "IT")) else stem
+        _consider(owner)
+        _consider(stem)
+    return tests
+
+
 def joern_slice_selection(
     root: Path,
     changed_files: list[str],
     joern_slice: str | None = None,
     joern_parse: str | None = None,
 ) -> dict[str, Any]:
-    """Read or generate bounded Joern CPG usage and DDG slices."""
-    path = next((root / rel for rel in _JOERN_OUTPUTS if (root / rel).is_file()), None)
+    """Read or generate Joern CPG usage and data-flow slices (not a PDG)."""
+    path = next((
+        root / rel for rel in _JOERN_OUTPUTS
+        if (root / rel).is_file() and _artifact_is_fresh(root, root / rel)
+    ), None)
     generated: tempfile.TemporaryDirectory[str] | None = None
     command_result: dict[str, Any] | None = None
     cpg_candidates = [
@@ -425,12 +633,11 @@ def joern_slice_selection(
         root / "target" / "cpg.bin", root / "build" / "cpg.bin",
         joern_cpg_path(root),
     ]
-    cpg = next((candidate for candidate in cpg_candidates if candidate.is_file()), None)
+    cpg = next((
+        candidate for candidate in cpg_candidates
+        if candidate.is_file() and _artifact_is_fresh(root, candidate)
+    ), None)
     cpg_build: dict[str, Any] | None = None
-    if path is None and cpg is None and joern_slice and joern_parse:
-        cpg_build = build_joern_cpg(root)
-        if cpg_build.get("ok") and cpg_build.get("artifact"):
-            cpg = Path(cpg_build["artifact"])
     if path is None and cpg is not None and joern_slice:
         cache = Path.home() / ".cache" / "cachelayer-toolchain"
         cache.mkdir(parents=True, exist_ok=True)
@@ -460,11 +667,21 @@ def joern_slice_selection(
                 str(item.get("output") or "") for item in (usage, data_flow)
             ),
         }
-        output_files = sorted(Path(generated.name).glob("*.json"))
+        generated_root = Path(generated.name)
+        prefixes = (output_base.name, output_base.name + "-dataflow")
+        output_files = sorted(
+            candidate
+            for candidate in generated_root.rglob("*.json")
+            if any(
+                part.startswith(prefix)
+                for part in candidate.relative_to(generated_root).parts
+                for prefix in prefixes
+            )
+        )
         if not command_result.get("ok") or not output_files:
             generated.cleanup()
             return {
-                "available": False, "tests": [],
+                "available": False, "tests": [], "pdg": False,
                 "reason": "Joern CPG slicing failed; using bounded static type/import slice",
                 "detail": str(command_result.get("output") or "")[-500:],
                 "cpg_build": cpg_build,
@@ -475,39 +692,75 @@ def joern_slice_selection(
                 value = json.loads(output_file.read_text(**_READ))
             except (OSError, ValueError):
                 continue
-            merged.extend(
-                value if isinstance(value, list)
-                else value.get("slices", value.get("results", [value]))
-            )
+            if isinstance(value, list):
+                merged.extend(value)
+            elif isinstance(value, dict):
+                if "slices" in value and isinstance(value["slices"], list):
+                    merged.extend(value["slices"])
+                elif "results" in value and isinstance(value["results"], list):
+                    merged.extend(value["results"])
+                else:
+                    merged.append(value)
         path = Path(generated.name) / "merged.json"
         path.write_text(json.dumps(merged), encoding="utf-8")
     if path is None:
         return {
-            "available": False, "tests": [],
+            "available": False, "tests": [], "pdg": False,
             "reason": "Joern/CPG unavailable; using bounded static type/import slice",
             "cpg_build": cpg_build,
         }
     try:
         if path.stat().st_size > 5_000_000:
-            return {"available": False, "tests": [], "reason": "Joern slice exceeds 5 MB parse bound"}
+            return {
+                "available": False, "tests": [], "pdg": False,
+                "reason": "Joern slice exceeds 5 MB parse bound",
+            }
         payload = json.loads(path.read_text(**_READ))
     except (OSError, ValueError) as exc:
-        return {"available": False, "tests": [], "reason": f"unreadable Joern slice: {exc}"}
+        return {
+            "available": False, "tests": [], "pdg": False,
+            "reason": f"unreadable Joern slice: {exc}",
+        }
     finally:
         if generated is not None:
             generated.cleanup()
     changed_symbols = {Path(rel).stem for rel in changed_files}
     tests: list[str] = []
-    records = payload if isinstance(payload, list) else payload.get("slices", payload.get("results", []))
-    for record in records[:2000] if isinstance(records, list) else []:
-        text = json.dumps(record, ensure_ascii=True)
-        if changed_symbols and not any(re.search(rf"\b{re.escape(symbol)}\b", text) for symbol in changed_symbols):
+    rejected_unknown = 0
+    accepted_kinds: list[str] = []
+    if isinstance(payload, dict) and _joern_record_kind(payload):
+        records = [payload]
+    elif isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        nested = payload.get("slices", payload.get("results"))
+        records = nested if isinstance(nested, list) else []
+        if not records:
+            rejected_unknown += 1
+    else:
+        records = []
+        rejected_unknown += 1
+    for record in records[:2000]:
+        kind = _joern_record_kind(record)
+        if kind is None:
+            rejected_unknown += 1
             continue
-        for match in re.findall(r"(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)", text):
+        if kind not in accepted_kinds:
+            accepted_kinds.append(kind)
+        for match in _joern_tests_from_record(record, changed_symbols):
             if match not in tests:
                 tests.append(match)
             if len(tests) >= MAX_TESTS:
                 break
+        if len(tests) >= MAX_TESTS:
+            break
+    if not accepted_kinds:
+        return {
+            "available": False, "tests": [], "pdg": False,
+            "reason": "Joern slice schema unrecognized; using bounded static type/import slice",
+            "rejected_unknown_records": rejected_unknown,
+            "cpg_build": cpg_build,
+        }
     try:
         report_file = path.relative_to(root).as_posix()
     except ValueError:
@@ -515,11 +768,16 @@ def joern_slice_selection(
     return {
         "available": True,
         "tests": tests,
+        "selection_incomplete": len(records) > 2000 or len(tests) >= MAX_TESTS,
         "file": report_file,
         "source": "joern-cpg-usage-dataflow-slice",
+        "pdg": False,
+        "slice_kinds": accepted_kinds,
+        "rejected_unknown_records": rejected_unknown,
         "reason": (
-            "generated Joern CPG usage and DDG slices"
-            if command_result is not None else "existing Joern slice output"
+            "generated Joern CPG usage and data-flow slices (not a PDG)"
+            if command_result is not None
+            else "existing Joern usage/data-flow or legacy callers slice (not a PDG)"
         ),
         "cpg": str(cpg) if cpg is not None else None,
         "cpg_build": cpg_build,
@@ -537,6 +795,8 @@ def coverage_context_tests(root: Path, changed_files: list[str]) -> dict[str, An
     db = root / ".coverage"
     if not db.is_file():
         return {"tests": [], "available": False, "reason": "no .coverage database"}
+    if not _artifact_is_fresh(root, db):
+        return {"tests": [], "available": False, "reason": "stale or unprovable .coverage database"}
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
     except sqlite3.Error as exc:
@@ -593,7 +853,12 @@ def coverage_context_tests(root: Path, changed_files: list[str]) -> dict[str, An
             "reason": "coverage database has no per-test contexts",
             "install": "Record contexts once: pytest --cov --cov-context=test",
         }
-    return {"tests": tests[:MAX_TESTS], "available": True, "reason": "coverage contexts"}
+    return {
+        "tests": tests[:MAX_TESTS],
+        "available": True,
+        "reason": "coverage contexts",
+        "selection_incomplete": len(tests) > MAX_TESTS,
+    }
 
 
 # --- python import graph (reverse forward-slice) ----------------------------------
@@ -656,7 +921,11 @@ def python_importers(root: Path, changed_files: list[str], depth: int = 2) -> di
         seen |= found
         frontier = found
 
-    return {"files": collected[:MAX_TESTS * 2], "hops": depth}
+    return {
+        "files": collected[:MAX_TESTS * 2],
+        "hops": depth,
+        "selection_incomplete": len(collected) > MAX_TESTS * 2,
+    }
 
 
 # --- jacoco ------------------------------------------------------------------------
@@ -666,15 +935,16 @@ def _jacoco_report(root: Path) -> Path | None:
         path = root / rel
         if path.is_file():
             return path
-    for path in root.rglob("jacoco*.xml"):
-        parts = set(path.relative_to(root).parts)
-        if (
-            path.is_file()
-            and not (parts & SKIP_PARTS - {"target", "build"})
-            and not (parts & {"per-test", "sessions", "jacoco-per-test", "test-coverage"})
-            and not path.stem.startswith("session_")
-        ):
-            return path
+    allowed_build = {"target", "build"}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in (SKIP_PARTS - allowed_build)
+            and name not in {"per-test", "sessions", "jacoco-per-test", "test-coverage"}
+        ]
+        for name in filenames:
+            if name.startswith("jacoco") and name.endswith(".xml"):
+                return Path(dirpath) / name
     return None
 
 

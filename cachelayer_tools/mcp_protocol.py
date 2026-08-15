@@ -6,16 +6,20 @@ import sys
 from typing import Any, Callable
 
 try:
-    from .util import capped_json
+    from .process_util import capped_json
 except ImportError:
-    from util import capped_json
+    from process_util import capped_json
 
 PROTOCOL = "2024-11-05"
+MAX_MESSAGE_BYTES = 1_000_000
+MAX_HEADER_BYTES = 16_384
 
 
 def _read_stdio_message() -> dict[str, Any] | None:
-    header = sys.stdin.buffer.readline()
+    header = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 1)
     if not header:
+        return None
+    if len(header) > MAX_MESSAGE_BYTES:
         return None
     # MCP stdio uses one compact JSON-RPC message per line.
     if header.lstrip().startswith(b"{"):
@@ -27,13 +31,17 @@ def _read_stdio_message() -> dict[str, Any] | None:
     # Accept legacy Content-Length framing from older hosts.
     headers = {}
     line = header
+    header_bytes = len(header)
     while line not in (b"", b"\r\n", b"\n"):
         try:
             k, v = line.decode("utf-8").split(":", 1)
             headers[k.strip().lower()] = v.strip()
         except Exception:
             pass
-        line = sys.stdin.buffer.readline()
+        line = sys.stdin.buffer.readline(MAX_HEADER_BYTES + 1)
+        header_bytes += len(line)
+        if header_bytes > MAX_HEADER_BYTES:
+            return None
         if not line:
             break
     try:
@@ -41,6 +49,8 @@ def _read_stdio_message() -> dict[str, Any] | None:
     except ValueError:
         return {}
     if n <= 0:
+        return None
+    if n > MAX_MESSAGE_BYTES:
         return None
     body = sys.stdin.buffer.read(n)
     try:
@@ -65,24 +75,35 @@ def serve(tools: dict[str, tuple[dict[str, Any], Callable[..., Any]]]) -> None:
         msg = _read_stdio_message()
         if msg is None:
             break
+        mid = msg.get("id") if isinstance(msg, dict) else None
+        respond = mid is not None
         if not msg or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
-            _write_stdio_message({
-                "jsonrpc": "2.0",
-                "id": msg.get("id") if msg else None,
-                "error": {"code": -32600, "message": "Invalid Request"},
-            })
+            if respond:
+                _write_stdio_message({
+                    "jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                })
             continue
-        mid = msg.get("id")
         method = msg.get("method")
-        params = msg.get("params") or {}
+        params = msg.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if respond:
+                _write_stdio_message({
+                    "jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32602, "message": "Params must be an object"},
+                })
+            continue
+        if not respond and not method.startswith("notifications/") and method != "exit":
+            continue
 
         if method == "initialize":
-            requested = params.get("protocolVersion")
             _write_stdio_message({
                 "jsonrpc": "2.0",
                 "id": mid,
                 "result": {
-                    "protocolVersion": requested if isinstance(requested, str) else PROTOCOL,
+                    "protocolVersion": PROTOCOL,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "cachelayer-agent", "version": "1.0.0"},
                     "instructions": (
@@ -98,7 +119,8 @@ def serve(tools: dict[str, tuple[dict[str, Any], Callable[..., Any]]]) -> None:
         if method == "notifications/initialized":
             continue
         if method == "ping":
-            _write_stdio_message({"jsonrpc": "2.0", "id": mid, "result": {}})
+            if respond:
+                _write_stdio_message({"jsonrpc": "2.0", "id": mid, "result": {}})
             continue
         if method == "tools/list":
             _write_stdio_message({
@@ -109,7 +131,9 @@ def serve(tools: dict[str, tuple[dict[str, Any], Callable[..., Any]]]) -> None:
             continue
         if method == "tools/call":
             name = params.get("name")
-            args = params.get("arguments") or {}
+            args = params.get("arguments", {})
+            if args is None:
+                args = {}
             if name not in tools:
                 _write_stdio_message({
                     "jsonrpc": "2.0",

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import atexit
 import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -18,10 +20,17 @@ DEFAULT_TIMEOUT_S = 20
 HOOK_TIMEOUT_S = 6
 MAX_CAPTURE_BYTES = 256_000
 DEFAULT_MEMORY_MB = 768
+_PROCESSES: set[subprocess.Popen[bytes]] = set()
+_PROCESS_LOCK = threading.Lock()
 
 CODE_EXTS = {
     ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".java", ".kt", ".kts", ".go", ".rs",
+}
+RISK_CONFIG_NAMES = {
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "package.json", "pytest.ini", "pyproject.toml",
+    "setup.cfg", "tox.ini",
 }
 
 SKIP_PARTS = {
@@ -51,7 +60,7 @@ def workspace_root(cwd: str | None = None) -> Path:
 
 def is_code_path(path: str | Path) -> bool:
     p = Path(path)
-    if p.suffix.lower() not in CODE_EXTS:
+    if p.suffix.lower() not in CODE_EXTS and p.name not in RISK_CONFIG_NAMES:
         return False
     parts = set(p.parts)
     return not (parts & SKIP_PARTS)
@@ -119,6 +128,9 @@ def run_cmd(
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_kwargs["start_new_session"] = True
+        limiter = _memory_preexec(memory_mb)
+        if limiter is not None:
+            popen_kwargs["preexec_fn"] = limiter
     try:
         with tempfile.TemporaryFile() as output:
             proc = subprocess.Popen(
@@ -131,7 +143,11 @@ def run_cmd(
                 creationflags=creationflags,
                 **popen_kwargs,
             )
-            memory_limited = _limit_process_memory(proc, memory_mb)
+            with _PROCESS_LOCK:
+                _PROCESSES.add(proc)
+            memory_limited = bool(popen_kwargs.get("preexec_fn"))
+            if not memory_limited:
+                memory_limited = _limit_process_memory(proc, memory_mb)
             try:
                 proc.communicate(
                     input=input_text.encode("utf-8") if input_text is not None else None,
@@ -139,7 +155,14 @@ def run_cmd(
                 )
             except subprocess.TimeoutExpired:
                 _terminate_process(proc)
-                proc.communicate()
+                try:
+                    proc.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    _kill_process(proc)
+                    try:
+                        proc.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
                 return {
                     "ok": False,
                     "code": 124,
@@ -148,6 +171,10 @@ def run_cmd(
                     "timeout": True,
                     "memory_limited": memory_limited,
                 }
+            finally:
+                if proc.poll() is not None:
+                    with _PROCESS_LOCK:
+                        _PROCESSES.discard(proc)
             output.seek(0, os.SEEK_END)
             size = output.tell()
             truncated = size > MAX_CAPTURE_BYTES
@@ -196,17 +223,70 @@ def _limit_process_memory(proc: subprocess.Popen[bytes], memory_mb: int | None) 
         return False
 
 
+def _memory_preexec(memory_mb: int | None):
+    if os.name == "nt" or memory_mb is None:
+        return None
+    try:
+        import resource
+    except ImportError:
+        return None
+    limit_mb = max(256, min(int(memory_mb), 1536))
+    limit = limit_mb * 1024 * 1024
+
+    def apply_limit() -> None:
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    return apply_limit
+
+
 def _terminate_process(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        return
     try:
         if os.name == "nt":
-            proc.kill()
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=1, check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _kill_process(proc)
+
+
+def _kill_process(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=1, check=False,
+            )
         else:
             os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
         try:
             proc.kill()
         except OSError:
             pass
+
+
+def _cleanup_processes() -> None:
+    with _PROCESS_LOCK:
+        processes = list(_PROCESSES)
+    for proc in processes:
+        _terminate_process(proc)
+
+
+atexit.register(_cleanup_processes)
 
 
 def format_argv(argv: list[str]) -> str:
@@ -217,14 +297,29 @@ def format_argv(argv: list[str]) -> str:
 
 
 def git_changed_files(root: Path) -> list[str]:
-    r = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD", "--"], cwd=root, timeout=8)
+    r = run_cmd(
+        ["git", "diff", "--name-only", "--diff-filter=ACMRD", "HEAD", "--"],
+        cwd=root, timeout=8,
+    )
     if not r.get("ok"):
-        r = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "--"], cwd=root, timeout=8)
+        r = run_cmd(
+            ["git", "diff", "--name-only", "--diff-filter=ACMRD", "--"],
+            cwd=root, timeout=8,
+        )
     files = []
     for line in (r.get("output") or "").splitlines():
         line = line.strip()
         if line and is_code_path(line):
             files.append(line)
+    untracked = run_cmd(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=root, timeout=8,
+    )
+    if untracked.get("ok"):
+        for line in (untracked.get("output") or "").splitlines():
+            line = line.strip()
+            if line and is_code_path(line) and line not in files:
+                files.append(line)
     return files
 
 

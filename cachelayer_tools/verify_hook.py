@@ -7,14 +7,15 @@ import hashlib
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from critic import verify_edit
-from util import is_code_path
+from verify_edit import verify_edit
+from process_util import is_code_path
 
 EMPTY = "{}"
 
@@ -27,7 +28,6 @@ _EDIT_ALIASES = {
     "multi_replace_string_in_file", "patch_file",
 }
 _NEVER = ("todo", "plan", "search", "fetch", "read", "grep", "glob", "view", "list", "mcp", "shell", "bash")
-_HOOK_STATE = ".cachelayer/critic-hook-state.json"
 _DEDUP_SECONDS = 30
 
 _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update)\s+File:\s*(.+?)\s*$", re.MULTILINE)
@@ -135,14 +135,32 @@ def _extract_paths(payload: dict) -> list[str]:
 
 
 def _deduplicated(root: Path, normalized: dict, paths: list[str]) -> bool:
+    snapshots: list[str] = []
+    for raw in paths[:100]:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = root / path
+        try:
+            stat = path.stat()
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                digest.update(stream.read(256_000))
+            snapshots.append(
+                f"{raw}:{stat.st_mtime_ns}:{stat.st_size}:{digest.hexdigest()}"
+            )
+        except OSError:
+            snapshots.append(f"{raw}:missing")
     identity = normalized["event_id"] or json.dumps({
         "tool": normalized["tool_name"].lower(),
         "paths": paths,
         "cycle": normalized["cycle_id"],
         "input": normalized["tool_input"],
+        "snapshots": snapshots,
     }, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-    path = root / _HOOK_STATE
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    root_key = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:20]
+    path = cache / "cachelayer" / "critic-hook" / root_key / "state.json"
     now = int(__import__("time").time())
     try:
         prior = json.loads(path.read_text(encoding="utf-8"))
@@ -152,9 +170,13 @@ def _deduplicated(root: Path, normalized: dict, paths: list[str]) -> bool:
         pass
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"digest": digest, "at": now}), encoding="utf-8")
-        temporary.replace(path)
+        fd, name = tempfile.mkstemp(prefix=".state.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"digest": digest, "at": now}, stream)
+            os.replace(name, path)
+        finally:
+            Path(name).unlink(missing_ok=True)
     except OSError:
         pass
     return False

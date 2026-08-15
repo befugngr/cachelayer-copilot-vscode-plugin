@@ -13,11 +13,11 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from critic import verify_edit
-from debug import debug_failure
-from protocol import serve
-from tia import run_affected_tests
-from tia_prepare import prepare_tia
+from verify_edit import verify_edit
+from debug_failure import debug_failure
+from mcp_protocol import serve
+from affected_tests import run_affected_tests
+from test_baselines import prepare_tia
 
 _VERIFY = {
     "name": "verify_edit",
@@ -64,9 +64,10 @@ _TIA = {
     "name": "run_affected_tests",
     "description": (
         "Run only safely selected tests. Priority is Smart Test Picker, seeded STARTS/Ekstazi, "
-        "safety-inspected Gradle affectedTest, native per-test JaCoCo reports, then bounded static "
-        "type/import/Joern selection. Aggregate jacoco.xml is validation only. FULL_SUITE escalation "
-        "is refused. Set seed_rts=true only to return a non-mutating install/baseline plan."
+        "safety-inspected Gradle affectedTest, native per-test JaCoCo reports, then Joern "
+        "usage/data-flow slices (not a PDG) or bounded static type/import selection. Aggregate "
+        "jacoco.xml is validation only. FULL_SUITE escalation is refused. Set seed_rts=true only "
+        "to return a non-mutating install/baseline plan."
     ),
     "inputSchema": {
         "type": "object",

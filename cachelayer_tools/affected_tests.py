@@ -4,30 +4,32 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 try:
-    from .detect import detect
-    from .tia_select import (
+    from .workspace_detect import detect
+    from .test_selection import (
         coverage_context_tests, jacoco_covered_classes, jacoco_diff_coverage,
         fresh_java_test_reports, java_dependents, java_test_report_snapshot,
         jacoco_per_test_selection, joern_slice_selection, native_rts_selection,
         python_importers, rts_seed_plan, smart_test_picker_map,
         smart_test_picker_selection,
     )
-    from .util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
+    from .process_util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
 except ImportError:
-    from detect import detect
-    from tia_select import (
+    from workspace_detect import detect
+    from test_selection import (
         coverage_context_tests, jacoco_covered_classes, jacoco_diff_coverage,
         fresh_java_test_reports, java_dependents, java_test_report_snapshot,
         jacoco_per_test_selection, joern_slice_selection, native_rts_selection,
         python_importers, rts_seed_plan, smart_test_picker_map,
         smart_test_picker_selection,
     )
-    from util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
+    from process_util import cap_text, git_changed_files, is_code_path, rel_to_root, run_cmd, which
 
 _FAIL_RE = re.compile(r"^(FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 _SUMMARY_COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped|deselected)")
@@ -89,12 +91,71 @@ def _pytest_result(result: dict[str, Any], runner: str, tests: list[str] | None 
 
 
 def _run_pytest_testmon(root: Path, python: str, timeout: int) -> dict[str, Any]:
-    result = run_cmd(
-        [python, "-m", "pytest", "-q", "--testmon", "--tb=line"],
+    database = root / ".testmondata"
+    usable = False
+    try:
+        if 0 < database.stat().st_size <= 50_000_000:
+            conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=1)
+            try:
+                usable = bool(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1"
+                ).fetchone())
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error):
+        usable = False
+    if not usable:
+        return {
+            "ok": False,
+            "available": True,
+            "runner": "pytest-testmon",
+            "selected": 0,
+            "tests": [],
+            "selection_incomplete": True,
+            "summary": "Refused cold pytest-testmon: no seeded usable .testmondata database.",
+            "full_suite_refused": True,
+            "install": "Seed testmon explicitly with a reviewed baseline before affected-test runs.",
+        }
+    preview = run_cmd(
+        [python, "-m", "pytest", "-q", "--collect-only", "--testmon"],
         cwd=root,
-        timeout=timeout,
+        timeout=min(timeout, 20),
     )
-    return _pytest_result(result, "pytest-testmon")
+    output = preview.get("output") or ""
+    selected_ids = list(dict.fromkeys(
+        line.strip() for line in output.splitlines()
+        if "::" in line and " " not in line.strip()
+    ))
+    _, deselected, _ = _summary(output)
+    if not preview.get("ok") or deselected is None:
+        return {
+            "ok": False, "available": True, "runner": "pytest-testmon",
+            "selected": 0, "tests": [], "selection_incomplete": True,
+            "summary": "Refused pytest-testmon because collect-only did not prove a bounded selection.",
+            "full_suite_refused": True,
+        }
+    if len(selected_ids) > 50:
+        return {
+            "ok": False, "available": True, "runner": "pytest-testmon",
+            "selected": 0, "tests": selected_ids[:50], "selection_incomplete": True,
+            "summary": "Refused pytest-testmon because selected tests exceeded the cap.",
+            "full_suite_refused": True,
+        }
+    if not selected_ids:
+        return {
+            "ok": True, "available": True, "runner": "pytest-testmon",
+            "selected": 0, "skipped_estimate": deselected, "tests": [],
+            "selection_incomplete": False,
+            "summary": "Seeded pytest-testmon selected zero tests; no suite was run.",
+        }
+    result = run_cmd(
+        [python, "-m", "pytest", "-q", "--tb=line", *selected_ids],
+        cwd=root, timeout=max(1, timeout - min(timeout, 20)),
+    )
+    payload = _pytest_result(result, "pytest-testmon", selected_ids)
+    payload["selection_proven"] = True
+    payload["selection_incomplete"] = False
+    return payload
 
 
 def _python_test_candidates(root: Path, files: list[str]) -> list[str]:
@@ -127,6 +188,13 @@ def _run_pytest_coverage_contexts(
     tests = ctx.get("tests") or []
     if not tests:
         return None
+    if ctx.get("selection_incomplete"):
+        return {
+            "ok": False, "available": True, "runner": "pytest-coverage-contexts",
+            "selected": 0, "tests": tests[:50], "selection_incomplete": True,
+            "full_suite_refused": True,
+            "summary": "Refused coverage-context selection because the test cap truncated results.",
+        }
     result = run_cmd([python, "-m", "pytest", "-q", "--tb=line", *tests], cwd=root, timeout=timeout)
     payload = _pytest_result(result, "pytest-coverage-contexts", tests)
     payload["selection_sources"] = ["coverage-contexts"]
@@ -148,6 +216,14 @@ def _run_pytest_mapped(root: Path, files: list[str], python: str, timeout: int) 
         if extra:
             tests.extend(extra)
             sources.append("import-graph")
+
+    if len(tests) >= 50 or slice_info.get("selection_incomplete"):
+        return {
+            "ok": False, "available": True, "runner": "pytest-mapped",
+            "selected": 0, "tests": tests[:50], "selection_incomplete": True,
+            "full_suite_refused": True, "selection_sources": sources,
+            "summary": "Refused mapped pytest selection because a scan/test cap may have truncated results.",
+        }
 
     coverage_hint = coverage_context_tests(root, files)
     if not tests:
@@ -195,6 +271,14 @@ def _run_jest(root: Path, files: list[str], timeout: int) -> dict[str, Any]:
             "ok": True, "available": True, "runner": "jest-findRelatedTests", "selected": 0,
             "skipped_estimate": None, "summary": "No changed JS/TS files; Jest was not run.",
         }
+    if len(source_files) > 30:
+        return {
+            "ok": False, "available": True, "runner": "jest-findRelatedTests",
+            "selected": 0, "tests": [], "selection_incomplete": True,
+            "full_suite_refused": True,
+            "changed_files": source_files[:30],
+            "summary": "Refused Jest selection because changed JS/TS inputs exceeded the cap.",
+        }
     result = run_cmd(
         [*command, "--findRelatedTests", *source_files[:30], "--runInBand", "--passWithNoTests"],
         cwd=root,
@@ -223,19 +307,63 @@ def _java_fq_test(path: Path) -> str:
 
 def _java_test_inventory(root: Path) -> list[str]:
     tests: list[str] = []
-    patterns = ("*Test.java", "*Tests.java", "*IT.java", "*Test.kt", "*Tests.kt", "*IT.kt")
-    for marker in ("java", "kotlin"):
-        for base in root.glob(f"**/src/test/{marker}"):
-            if not base.is_dir():
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in {"node_modules", ".git", "build", "target", ".gradle"}
+        ]
+        parts = Path(dirpath).relative_to(root).parts
+        in_tests = any(
+            parts[index:index + 3] in (("src", "test", "java"), ("src", "test", "kotlin"))
+            for index in range(max(0, len(parts) - 2))
+        )
+        for name in filenames:
+            if not in_tests or not name.endswith(
+                ("Test.java", "Tests.java", "IT.java", "Test.kt", "Tests.kt", "IT.kt")
+            ):
                 continue
-            for pattern in patterns:
-                for path in base.rglob(pattern):
-                    fq = _java_fq_test(path)
-                    if fq not in tests:
-                        tests.append(fq)
-                    if len(tests) >= 4000:
-                        return tests
+            visited += 1
+            path = Path(dirpath) / name
+            fq = _java_fq_test(path)
+            if fq not in tests:
+                tests.append(fq)
+            if visited >= 4000:
+                return tests
     return tests
+
+
+def _gradle_subset_args(root: Path, gradle: str, tests: list[str]) -> list[str]:
+    """Use module-qualified test tasks when test sources reveal module identity."""
+    task_by_test: dict[str, str] = {}
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in {"node_modules", ".git", "build", "target", ".gradle"}
+        ]
+        for name in filenames:
+            if not name.endswith((".java", ".kt")):
+                continue
+            visited += 1
+            if visited > 4000:
+                break
+            path = Path(dirpath) / name
+            rel = path.relative_to(root)
+            if "src" not in rel.parts or "test" not in rel.parts:
+                continue
+            fq = _java_fq_test(rel)
+            module_parts = rel.parts[:rel.parts.index("src")]
+            task_by_test[fq] = (
+                ":" + ":".join(module_parts) + ":test" if module_parts else "test"
+            )
+        if visited > 4000:
+            break
+    tasks = list(dict.fromkeys(task_by_test.get(test, "test") for test in tests))
+    args = [gradle, "-q", *tasks]
+    for test in tests:
+        args.extend(["--tests", test])
+    return args
 
 
 def _java_test_classes(root: Path, files: list[str]) -> list[str]:
@@ -276,6 +404,10 @@ def _java_static_selection(
     if joern_tests:
         tests.extend(joern_tests)
         sources.append(str(joern.get("source") or "joern-cpg-usage-dataflow-slice"))
+    joern["selection_incomplete"] = bool(
+        joern.get("selection_incomplete") or len(tests) >= 40
+        or graph.get("selection_incomplete")
+    )
     return tests[:40], sources, joern
 
 
@@ -463,31 +595,47 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     if not mvn:
         return {"ok": False, "available": False, "runner": "maven", "install": "Install Maven or add mvnw/mvnw.cmd."}
     inventory = _java_test_inventory(root)
-    tests, sources, joern = _java_static_selection(root, files, info)
+    tests: list[str] = []
+    sources: list[str] = []
+    joern: dict[str, Any] = {
+        "available": False, "tests": [], "pdg": False,
+        "reason": "deferred until cheap RTS selectors miss",
+    }
     metadata = _java_metadata(root, info, files)
     jacoco = metadata["jacoco"]
     picker_map = smart_test_picker_map(root)
     if info["flags"].get("smart_test_picker") and picker_map:
         prior = smart_test_picker_selection(root)
-        if prior and prior.get("status") == "FULL_SUITE":
+        if not prior or prior.get("status") != "SELECTED" or prior.get("selection_incomplete"):
             return {
                 "ok": False, "available": True, "runner": "maven-smart-test-picker",
                 "selected": 0, "tests": [], "skipped_estimate": len(inventory),
                 "selection_sources": ["smart-picker-per-test-jacoco-map"],
-                "summary": "Refused Smart Test Picker because its selector status is FULL_SUITE.",
+                "summary": "Refused Smart Test Picker because prior output was not a complete SELECTED result.",
                 "full_suite_refused": True, "selection": prior,
             }
-        payload = _run_dynamic_java(
-            root,
-            [
-                mvn, "-q", "-DfailIfNoTests=false",
-                "com.sap.oss.smart-test-picker:smart-test-picker-maven:0.1.0:smart-test",
-            ],
-            timeout,
-            runner="maven-smart-test-picker", sources=["smart-picker-per-test-jacoco-map"],
-            inventory_count=len(inventory), metadata=metadata, smart_picker=True,
+        mapped = [str(test).split("#", 1)[0] for test in prior.get("tests") or []]
+        if not mapped:
+            return {
+                "ok": True, "available": True, "runner": "maven-smart-test-picker",
+                "selected": 0, "tests": [], "skipped_estimate": len(inventory),
+                "selection_sources": ["smart-picker-per-test-jacoco-map"],
+                "summary": "Smart Test Picker explicitly selected zero tests; no suite was run.",
+                "selection": prior,
+            }
+        result = run_cmd(
+            [mvn, "-q", "-DfailIfNoTests=false",
+             "-Dsurefire.failIfNoSpecifiedTests=false",
+             f"-Dtest={','.join(mapped)}", "test"],
+            cwd=root, timeout=timeout,
+        )
+        payload = _java_result(
+            result, runner="maven-smart-test-picker", tests=mapped,
+            sources=["smart-picker-per-test-jacoco-map"],
+            inventory_count=len(inventory), metadata=metadata,
         )
         payload["coverage_map"] = picker_map
+        payload["selection"] = prior
         return payload
     starts_db = bool(info["flags"].get("starts_seeded"))
     if info["flags"].get("starts") and starts_db:
@@ -495,30 +643,73 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
             [mvn, "--no-transfer-progress", "-DupdateSelectChecksums=false", "starts:select"],
             cwd=root, timeout=min(timeout, 60),
         )
-        return _run_dynamic_java(
-            root,
-            [mvn, "-q", "-DfailIfNoTests=false", "starts:starts"],
-            timeout,
-            runner="maven-starts", sources=["starts-static-rts"],
-            inventory_count=len(inventory), metadata=metadata, native_kind="starts",
-            native_preview=preview.get("output") or "", inventory=inventory,
+        selection = native_rts_selection(
+            root, "starts", len(inventory),
+            selector_output=preview.get("output") or "", inventory=inventory,
         )
+        mapped = selection.get("tests") or []
+        if not preview.get("ok") or not mapped or selection.get("selection_incomplete"):
+            return {
+                "ok": False, "available": True, "runner": "maven-starts",
+                "selected": 0, "tests": [], "selection_incomplete": True,
+                "full_suite_refused": True,
+                "summary": "Refused STARTS execution because starts:select did not prove a complete non-empty subset.",
+                "selection": selection,
+            }
+        result = run_cmd(
+            [mvn, "-q", "-DfailIfNoTests=false",
+             "-Dsurefire.failIfNoSpecifiedTests=false",
+             f"-Dtest={','.join(mapped)}", "test"],
+            cwd=root, timeout=timeout,
+        )
+        payload = _java_result(
+            result, runner="maven-starts", tests=mapped,
+            sources=["starts-select-goal"], inventory_count=len(inventory),
+            metadata=metadata,
+        )
+        payload["selection"] = selection
+        return payload
     ekstazi_db = bool(info["flags"].get("ekstazi_seeded"))
     if info["flags"].get("ekstazi") and ekstazi_db:
         preview = run_cmd(
             [mvn, "--no-transfer-progress", "ekstazi:predict"],
             cwd=root, timeout=min(timeout, 60),
         )
-        return _run_dynamic_java(
-            root,
-            [mvn, "-q", "-DfailIfNoTests=false", "test"],
-            timeout,
-            runner="maven-ekstazi", sources=["ekstazi-dependency-rts"],
-            inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
-            native_preview=preview.get("output") or "", inventory=inventory,
+        selection = native_rts_selection(
+            root, "ekstazi", len(inventory),
+            selector_output=preview.get("output") or "", inventory=inventory,
         )
+        mapped = selection.get("tests") or []
+        if not preview.get("ok") or not mapped or selection.get("selection_incomplete"):
+            return {
+                "ok": False, "available": True, "runner": "maven-ekstazi",
+                "selected": 0, "tests": [], "selection_incomplete": True,
+                "full_suite_refused": True,
+                "summary": "Refused Ekstazi execution because predict did not prove a complete non-empty subset.",
+                "selection": selection,
+            }
+        result = run_cmd(
+            [mvn, "-q", "-DfailIfNoTests=false",
+             "-Dsurefire.failIfNoSpecifiedTests=false",
+             f"-Dtest={','.join(mapped)}", "test"],
+            cwd=root, timeout=timeout,
+        )
+        payload = _java_result(
+            result, runner="maven-ekstazi", tests=mapped,
+            sources=["ekstazi-predict-goal"], inventory_count=len(inventory),
+            metadata=metadata,
+        )
+        payload["selection"] = selection
+        return payload
     native_jacoco = metadata["jacoco_per_test"]
     if native_jacoco.get("available") and native_jacoco.get("tests"):
+        if native_jacoco.get("selection_incomplete"):
+            return {
+                "ok": False, "available": True, "runner": "maven-surefire-subset",
+                "selected": 0, "tests": native_jacoco["tests"][:40],
+                "selection_incomplete": True, "full_suite_refused": True,
+                "summary": "Refused JaCoCo selection because the manifest test cap truncated results.",
+            }
         mapped = native_jacoco["tests"][:40]
         result = run_cmd(
             [
@@ -537,6 +728,15 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
         payload["coverage_map"] = native_jacoco
         payload["joern"] = joern
         return payload
+    tests, sources, joern = _java_static_selection(root, files, info)
+    if joern.get("selection_incomplete"):
+        return {
+            "ok": False, "available": True, "runner": "maven-surefire-subset",
+            "selected": 0, "tests": tests, "selection_incomplete": True,
+            "full_suite_refused": True, "selection_sources": sources,
+            "summary": "Refused static Java selection because a scan/test cap truncated results.",
+            "joern": joern,
+        }
     if tests:
         result = run_cmd(
             [
@@ -667,6 +867,7 @@ gradle.projectsEvaluated {
             "init_script": str(init_script),
         }
     statuses: list[str] = []
+    selected_tests: list[str] = []
     status_keys = {"status", "mode", "selectionstatus", "selection_status"}
     decoder = json.JSONDecoder()
     for index, char in enumerate(output):
@@ -681,6 +882,8 @@ gradle.projectsEvaluated {
         for key, child in value.items():
             if str(key).lower() in status_keys:
                 statuses.append(str(child).upper())
+            if str(key).lower() in {"tests", "selectedtests", "affectedtests"} and isinstance(child, list):
+                selected_tests.extend(str(item).split("#", 1)[0] for item in child if isinstance(item, str))
         for container in ("selection", "result", "affectedTests", "affected_tests"):
             child = value.get(container)
             if not isinstance(child, dict):
@@ -707,6 +910,8 @@ gradle.projectsEvaluated {
         "statuses": statuses,
         "init_script": str(init_script),
         "runtime_overrides": remediated_build_files,
+        "tests": list(dict.fromkeys(selected_tests))[:40],
+        "selection_incomplete": len(set(selected_tests)) > 40,
     }
 
 
@@ -715,43 +920,58 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
     if not gradle:
         return {"ok": False, "available": False, "runner": "gradle", "install": "Install Gradle or add gradlew/gradlew.bat."}
     inventory = _java_test_inventory(root)
-    tests, sources, joern = _java_static_selection(root, files, info)
+    tests: list[str] = []
+    sources: list[str] = []
+    joern: dict[str, Any] = {
+        "available": False, "tests": [], "pdg": False,
+        "reason": "deferred until cheap RTS selectors miss",
+    }
     metadata = _java_metadata(root, info, files)
     jacoco = metadata["jacoco"]
     picker_map = smart_test_picker_map(root)
     if info["flags"].get("smart_test_picker") and picker_map:
         prior = smart_test_picker_selection(root)
-        if prior and prior.get("status") == "FULL_SUITE":
+        if not prior or prior.get("status") != "SELECTED" or prior.get("selection_incomplete"):
             return {
                 "ok": False, "available": True, "runner": "gradle-smart-test-picker",
                 "selected": 0, "tests": [], "skipped_estimate": len(inventory),
                 "selection_sources": ["smart-picker-per-test-jacoco-map"],
-                "summary": "Refused Smart Test Picker because its selector status is FULL_SUITE.",
+                "summary": "Refused Smart Test Picker because prior output was not a complete SELECTED result.",
                 "full_suite_refused": True, "selection": prior,
             }
-        payload = _run_dynamic_java(
-            root,
-            [gradle, "-q", "selectTests", "smartTest"],
-            timeout,
-            runner="gradle-smart-test-picker", sources=["smart-picker-per-test-jacoco-map"],
-            inventory_count=len(inventory), metadata=metadata, smart_picker=True,
+        mapped = [str(test).split("#", 1)[0] for test in prior.get("tests") or []]
+        if not mapped:
+            return {
+                "ok": True, "available": True, "runner": "gradle-smart-test-picker",
+                "selected": 0, "tests": [], "skipped_estimate": len(inventory),
+                "selection_sources": ["smart-picker-per-test-jacoco-map"],
+                "summary": "Smart Test Picker explicitly selected zero tests; no suite was run.",
+                "selection": prior,
+            }
+        args = _gradle_subset_args(root, gradle, mapped)
+        result = run_cmd(args, cwd=root, timeout=timeout)
+        payload = _java_result(
+            result, runner="gradle-smart-test-picker", tests=mapped,
+            sources=["smart-picker-per-test-jacoco-map"],
+            inventory_count=len(inventory), metadata=metadata,
         )
         payload["coverage_map"] = picker_map
+        payload["selection"] = prior
         return payload
     if info["flags"].get("starts") and info["flags"].get("starts_seeded"):
-        return _run_dynamic_java(
-            root, [gradle, "starts"], timeout,
-            runner="gradle-starts", sources=["starts-static-rts"],
-            inventory_count=len(inventory), metadata=metadata, native_kind="starts",
-            inventory=inventory,
-        )
+        return {
+            "ok": False, "available": True, "runner": "gradle-starts",
+            "selected": 0, "tests": [], "selection_incomplete": True,
+            "full_suite_refused": True,
+            "summary": "Refused Gradle STARTS: no bounded pre-execution selection/explain contract is available.",
+        }
     if info["flags"].get("ekstazi") and info["flags"].get("ekstazi_seeded"):
-        return _run_dynamic_java(
-            root, [gradle, "test"], timeout,
-            runner="gradle-ekstazi", sources=["ekstazi-dependency-rts"],
-            inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
-            inventory=inventory,
-        )
+        return {
+            "ok": False, "available": True, "runner": "gradle-ekstazi",
+            "selected": 0, "tests": [], "selection_incomplete": True,
+            "full_suite_refused": True,
+            "summary": "Refused Gradle Ekstazi: no bounded pre-execution selection/explain contract is available.",
+        }
     if info["flags"].get("affected_tests"):
         inspection = _affected_test_inspection(root, gradle, timeout)
         if not inspection["safe"]:
@@ -767,16 +987,24 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
                 "inspection": inspection,
                 "install": "Configure affectedTest with full-suite fallback disabled and make --explain succeed.",
             }
+        mapped = inspection.get("tests") or []
+        if not mapped or inspection.get("selection_incomplete"):
+            Path(inspection["init_script"]).unlink(missing_ok=True)
+            return {
+                "ok": False, "available": True, "runner": "gradle-affected-test",
+                "selected": 0, "tests": [], "selection_incomplete": True,
+                "full_suite_refused": True,
+                "summary": "Refused affectedTest because explain did not provide a complete explicit test subset.",
+                "inspection": inspection,
+            }
         try:
-            payload = _run_dynamic_java(
-                root,
-                [
-                    gradle, "--no-daemon", "-q", "-I",
-                    inspection["init_script"], "affectedTest",
-                ],
-                timeout,
-                runner="gradle-affected-test", sources=["gradle-affected-tests"],
-                inventory_count=len(inventory), metadata=metadata,
+            args = _gradle_subset_args(root, gradle, mapped)
+            args.insert(1, "--no-daemon")
+            result = run_cmd(args, cwd=root, timeout=timeout)
+            payload = _java_result(
+                result, runner="gradle-affected-test", tests=mapped,
+                sources=["gradle-affected-tests"], inventory_count=len(inventory),
+                metadata=metadata,
             )
         finally:
             Path(inspection["init_script"]).unlink(missing_ok=True)
@@ -790,10 +1018,15 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
         return payload
     native_jacoco = metadata["jacoco_per_test"]
     if native_jacoco.get("available") and native_jacoco.get("tests"):
+        if native_jacoco.get("selection_incomplete"):
+            return {
+                "ok": False, "available": True, "runner": "gradle-tests-subset",
+                "selected": 0, "tests": native_jacoco["tests"][:40],
+                "selection_incomplete": True, "full_suite_refused": True,
+                "summary": "Refused JaCoCo selection because the manifest test cap truncated results.",
+            }
         mapped = native_jacoco["tests"][:40]
-        args = [gradle, "-q", "test"]
-        for test in mapped:
-            args.extend(["--tests", test])
+        args = _gradle_subset_args(root, gradle, mapped)
         result = run_cmd(args, cwd=root, timeout=timeout)
         payload = _java_result(
             result, runner="gradle-tests-subset", tests=mapped,
@@ -803,6 +1036,15 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
         payload["coverage_map"] = native_jacoco
         payload["joern"] = joern
         return payload
+    tests, sources, joern = _java_static_selection(root, files, info)
+    if joern.get("selection_incomplete"):
+        return {
+            "ok": False, "available": True, "runner": "gradle-tests-subset",
+            "selected": 0, "tests": tests, "selection_incomplete": True,
+            "full_suite_refused": True, "selection_sources": sources,
+            "summary": "Refused static Java selection because a scan/test cap truncated results.",
+            "joern": joern,
+        }
     if not tests:
         return {
             "ok": True, "available": True, "runner": "gradle-tests-subset", "selected": 0,
@@ -818,9 +1060,7 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
             "joern": joern,
             "rts_seed": rts_seed_plan(root, info),
         }
-    args = [gradle, "-q", "test"]
-    for test in tests:
-        args.extend(["--tests", test])
+    args = _gradle_subset_args(root, gradle, tests)
     result = run_cmd(args, cwd=root, timeout=timeout)
     payload = _java_result(
         result, runner="gradle-tests-subset", tests=tests,
@@ -856,7 +1096,42 @@ def run_affected_tests(
             "seed_executed": False, "changed_files": files[:30], **plan,
         }
 
-    if info["python"]:
+    risky_configs = {
+        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+        "settings.gradle.kts", "package.json", "pytest.ini", "pyproject.toml",
+        "setup.cfg", "tox.ini",
+    }
+    input_count = len(changed_files) if changed_files is not None else len(git_changed_files(root))
+    input_incomplete = input_count > len(files)
+    unmapped_risk = [
+        name for name in files
+        if Path(name).name in risky_configs or not (root / name).exists()
+    ]
+    partitions = {
+        "python": [name for name in files if Path(name).suffix.lower() in {".py", ".pyi"}
+                   or Path(name).name in {"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}],
+        "java": [name for name in files if Path(name).suffix.lower() in {".java", ".kt", ".kts"}
+                 or Path(name).name in {"pom.xml", "build.gradle", "build.gradle.kts",
+                                        "settings.gradle", "settings.gradle.kts"}],
+        "javascript": [name for name in files if Path(name).suffix.lower() in {
+            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"
+        } or Path(name).name == "package.json"],
+    }
+    applicable = [
+        language for language, names in partitions.items()
+        if names and (
+            (language == "python" and info.get("python"))
+            or (language == "java" and (info.get("maven") or info.get("gradle")))
+            or (language == "javascript" and info.get("javascript"))
+        )
+    ]
+    deadline = time.monotonic() + timeout
+    results: list[dict[str, Any]] = []
+
+    def remaining() -> int:
+        return max(1, int(deadline - time.monotonic()))
+
+    if "python" in applicable:
         python = info["tools"].get("python3")
         if not python:
             result = {"ok": False, "available": False, "runner": "pytest", "install": "Install Python 3 and pytest."}
@@ -864,33 +1139,71 @@ def run_affected_tests(
             result = {"ok": False, "available": False, "runner": "pytest", "install": "pip install pytest pytest-testmon"}
         elif info["flags"].get("testmon"):
             result = _run_pytest_testmon(
-                root, info["tools"].get("analysis-python") or python, timeout,
+                root, info["tools"].get("analysis-python") or python, remaining(),
             )
         else:
             result = (
-                _run_pytest_coverage_contexts(root, files, python, timeout)
-                or _run_pytest_mapped(root, files, python, timeout)
+                _run_pytest_coverage_contexts(root, partitions["python"], python, remaining())
+                or _run_pytest_mapped(root, partitions["python"], python, remaining())
             )
-        result["changed_files"] = files[:30]
-        return result
+        result["language"] = "python"
+        results.append(result)
 
-    if info["maven"]:
-        result = _run_maven(root, info, files, timeout)
-    elif info["gradle"]:
-        result = _run_gradle(root, info, files, timeout)
-    elif info["javascript"]:
-        result = _run_jest(root, files, timeout)
-    else:
-        result = {
+    if "java" in applicable:
+        result = (
+            _run_maven(root, info, partitions["java"], remaining())
+            if info["maven"] else
+            _run_gradle(root, info, partitions["java"], remaining())
+        )
+        result["language"] = "java"
+        results.append(result)
+
+    if "javascript" in applicable:
+        result = _run_jest(root, partitions["javascript"], remaining())
+        result["language"] = "javascript"
+        results.append(result)
+
+    if not results:
+        results.append({
             "ok": False,
             "available": False,
             "summary": "No supported test runner detected; no suite was run.",
             "install": "Python: pytest-testmon; JS/TS: Jest; Java: Maven Surefire/Ekstazi or Gradle.",
+        })
+    if len(results) == 1:
+        combined = results[0]
+    else:
+        selected_values = [item.get("selected") for item in results]
+        combined = {
+            "ok": all(item.get("ok") for item in results),
+            "available": any(item.get("available", True) for item in results),
+            "runner": "polyglot-bounded",
+            "runners": results,
+            "selected": (
+                sum(int(value) for value in selected_values)
+                if all(isinstance(value, int) for value in selected_values) else None
+            ),
+            "tests": [
+                test for item in results for test in (item.get("tests") or [])
+            ][:100],
+            "summary": f"Ran {len(results)} bounded language selectors.",
         }
-    result["changed_files"] = files[:30]
+    combined["changed_files"] = files[:30]
+    combined["selection_incomplete"] = bool(
+        input_incomplete or combined.get("selection_incomplete")
+        or any(item.get("selection_incomplete") for item in results)
+    )
+    if unmapped_risk and not any((item.get("selected") or 0) > 0 for item in results):
+        combined.update({
+            "ok": False,
+            "inconclusive": True,
+            "selection_incomplete": True,
+            "unmapped_risk": unmapped_risk[:30],
+            "summary": "Selection is inconclusive for deleted or build/config changes; zero tests is not a green result.",
+        })
     if info.get("java"):
-        result.setdefault("rts_seed", rts_seed_plan(root, info))
-    return result
+        combined.setdefault("rts_seed", rts_seed_plan(root, info))
+    return combined
 
 
 def _can_import_pytest() -> bool:
