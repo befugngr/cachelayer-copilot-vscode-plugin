@@ -546,7 +546,11 @@ def java_fault_localization(
         }
     help_result = run_cmd([*prefix, "--help"], cwd=root, timeout=8)
     help_text = help_result.get("output") or ""
-    if "--projectpath" not in help_text:
+    project_flag = next(
+        (flag for flag in ("--projectPath", "--projectpath", "-p") if flag in help_text),
+        None,
+    )
+    if project_flag is None:
         return {
             "available": True,
             "executed": False,
@@ -558,7 +562,7 @@ def java_fault_localization(
         output_file.unlink(missing_ok=True)
         result = run_cmd(
             [
-                *prefix, "--projectpath", str(root),
+                *prefix, project_flag, str(root),
                 "--format", "CSV", "--output", str(output_file),
             ],
             cwd=root,

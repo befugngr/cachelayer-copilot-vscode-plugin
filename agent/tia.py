@@ -32,6 +32,16 @@ _FAIL_RE = re.compile(r"^(FAILED|ERROR)\s+(\S+)", re.MULTILINE)
 _SUMMARY_COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped|deselected)")
 
 
+def _bounded_java_env(heap_mb: int = 512) -> dict[str, str]:
+    existing = os.environ.get("JAVA_TOOL_OPTIONS", "").strip()
+    limits = (
+        f"-Xmx{heap_mb}m -XX:CompressedClassSpaceSize=96m "
+        "-XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=128m "
+        "-Djdk.attach.allowAttachSelf=true -Djava.security.manager=allow"
+    )
+    return {"JAVA_TOOL_OPTIONS": f"{existing} {limits}".strip()}
+
+
 def _changed(root: Path, changed_files: list[str] | None) -> list[str]:
     raw = changed_files if changed_files is not None else git_changed_files(root)
     result: list[str] = []
@@ -255,11 +265,16 @@ def _java_static_selection(
     if extra:
         tests.extend(extra)
         sources.append("java-bounded-type-import-forward-slice")
-    joern = joern_slice_selection(root, files, info.get("tools", {}).get("joern-slice"))
+    joern = joern_slice_selection(
+        root,
+        files,
+        info.get("tools", {}).get("joern-slice"),
+        info.get("tools", {}).get("joern-parse"),
+    )
     joern_tests = [test for test in joern.get("tests") or [] if test not in tests]
     if joern_tests:
         tests.extend(joern_tests)
-        sources.append("joern-usage-call-slice")
+        sources.append(str(joern.get("source") or "joern-cpg-usage-dataflow-slice"))
     return tests[:40], sources, joern
 
 
@@ -313,6 +328,11 @@ def _java_result(
     dynamic_selector: bool = False,
 ) -> dict[str, Any]:
     output = result.get("output") or ""
+    output_lines = [line.strip() for line in output.splitlines() if line.strip()]
+    selector_summary = next(
+        (line for line in reversed(output_lines) if "Affected Tests:" in line),
+        output_lines[-1] if output_lines else "",
+    )
     jacoco = metadata["jacoco"]
     selected = None if dynamic_selector else len(tests)
     skipped = None if selected is None else max(0, inventory_count - selected)
@@ -324,10 +344,7 @@ def _java_result(
         "tests": tests,
         "selection_sources": sources,
         "failures": cap_text(output, 2500) if not result.get("ok") else "",
-        "summary": cap_text(
-            next((line for line in reversed(output.splitlines()) if line.strip()), ""),
-            400,
-        ),
+        "summary": cap_text(selector_summary, 400),
         "timed_out": bool(result.get("timeout")),
         "dynamic_selector": dynamic_selector,
         "jacoco_detected": bool(jacoco.get("configured")),
@@ -359,9 +376,14 @@ def _run_dynamic_java(
     metadata: dict[str, Any],
     smart_picker: bool = False,
     native_kind: str | None = None,
+    native_preview: str = "",
+    inventory: list[str] | None = None,
 ) -> dict[str, Any]:
     before = java_test_report_snapshot(root)
-    result = run_cmd(argv, cwd=root, timeout=timeout)
+    result = run_cmd(
+        argv, cwd=root, timeout=timeout, memory_mb=None,
+        env=_bounded_java_env(),
+    )
     reports = fresh_java_test_reports(root, before)
     payload = _java_result(
         result, runner=runner, tests=reports["tests"], sources=sources,
@@ -383,7 +405,13 @@ def _run_dynamic_java(
             payload["selector_reason"] = selection["reason"]
             payload["selector_fell_back_full_suite"] = selection["status"] == "FULL_SUITE"
     if native_kind:
-        native = native_rts_selection(root, native_kind, inventory_count)
+        native = native_rts_selection(
+            root,
+            native_kind,
+            inventory_count,
+            selector_output=native_preview,
+            inventory=inventory,
+        )
         payload["native_selection"] = native
         if native.get("selected") is not None:
             payload["tests"] = native["tests"]
@@ -459,23 +487,33 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
         )
         payload["coverage_map"] = picker_map
         return payload
-    starts_db = any(root.glob("**/.starts"))
+    starts_db = bool(info["flags"].get("starts_seeded"))
     if info["flags"].get("starts") and starts_db:
+        preview = run_cmd(
+            [mvn, "-q", "-DupdateSelectChecksums=false", "starts:select"],
+            cwd=root, timeout=min(timeout, 60),
+        )
         return _run_dynamic_java(
             root,
             [mvn, "-q", "-DfailIfNoTests=false", "starts:starts"],
             timeout,
             runner="maven-starts", sources=["starts-static-rts"],
             inventory_count=len(inventory), metadata=metadata, native_kind="starts",
+            native_preview=preview.get("output") or "", inventory=inventory,
         )
-    ekstazi_db = any(root.glob("**/.ekstazi"))
+    ekstazi_db = bool(info["flags"].get("ekstazi_seeded"))
     if info["flags"].get("ekstazi") and ekstazi_db:
+        preview = run_cmd(
+            [mvn, "-q", "ekstazi:predict"],
+            cwd=root, timeout=min(timeout, 60),
+        )
         return _run_dynamic_java(
             root,
             [mvn, "-q", "-DfailIfNoTests=false", "test"],
             timeout,
             runner="maven-ekstazi", sources=["ekstazi-dependency-rts"],
             inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
+            native_preview=preview.get("output") or "", inventory=inventory,
         )
     native_jacoco = metadata["jacoco_per_test"]
     if native_jacoco.get("available") and native_jacoco.get("tests"):
@@ -546,6 +584,7 @@ _FULL_SUITE_RE = re.compile(
 
 
 def _affected_test_inspection(root: Path, gradle: str, timeout: int) -> dict[str, Any]:
+    remediated_build_files: list[str] = []
     for build_name in ("build.gradle", "build.gradle.kts"):
         path = root / build_name
         if not path.is_file():
@@ -555,25 +594,55 @@ def _affected_test_inspection(root: Path, gradle: str, timeout: int) -> dict[str
         except OSError:
             continue
         if _FULL_SUITE_RE.search(text):
-            return {
-                "safe": False, "reason": f"{build_name} enables or advertises full-suite fallback",
-                "output": "",
+            remediated_build_files.append(build_name)
+    safety_dir = Path.home() / ".cache" / "cachelayer-toolchain" / "gradle"
+    safety_dir.mkdir(parents=True, exist_ok=True)
+    init_script = safety_dir / "cachelayer-affected-tests-safety.init.gradle"
+    init_script.write_text(
+        """
+gradle.projectsEvaluated {
+    allprojects { p ->
+        def ext = p.extensions.findByName("affectedTests")
+        if (ext != null) {
+            [
+                onEmptyDiff: "skipped",
+                onAllFilesIgnored: "skipped",
+                onAllFilesOutOfScope: "skipped",
+                onUnmappedFile: "selected",
+                onDiscoveryEmpty: "skipped",
+                onDiscoveryIncomplete: "selected"
+            ].each { key, value ->
+                if (ext.hasProperty(key)) {
+                    ext.setProperty(key, value)
+                }
             }
+        }
+    }
+}
+""".strip() + "\n",
+        encoding="utf-8",
+    )
     inspection = run_cmd(
-        [gradle, "-q", "affectedTest", "--explain"],
+        [gradle, "--no-daemon", "-q", "-I", str(init_script), "help", "--task", "affectedTest"],
         cwd=root,
-        timeout=min(timeout, 30),
+        timeout=min(timeout, 120),
+        memory_mb=None,
+        env=_bounded_java_env(),
     )
     output = inspection.get("output") or ""
-    if _FULL_SUITE_RE.search(output):
-        return {"safe": False, "reason": "affectedTest --explain reported FULL_SUITE", "output": output}
     if not inspection.get("ok"):
         return {
             "safe": False,
-            "reason": "affectedTest safety inspection failed; execution was not attempted",
+            "reason": "affectedTest safety init script failed; execution was not attempted",
             "output": output,
         }
-    return {"safe": True, "reason": "affectedTest --explain showed no full-suite escalation", "output": output}
+    return {
+        "safe": True,
+        "reason": "runtime safety policy pins every fallback away from FULL_SUITE",
+        "output": output,
+        "init_script": str(init_script),
+        "runtime_overrides": remediated_build_files,
+    }
 
 
 def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int) -> dict[str, Any]:
@@ -604,13 +673,13 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
         )
         payload["coverage_map"] = picker_map
         return payload
-    if info["flags"].get("starts") and any(root.glob("**/.starts")):
+    if info["flags"].get("starts") and info["flags"].get("starts_seeded"):
         return _run_dynamic_java(
             root, [gradle, "-q", "starts"], timeout,
             runner="gradle-starts", sources=["starts-static-rts"],
             inventory_count=len(inventory), metadata=metadata, native_kind="starts",
         )
-    if info["flags"].get("ekstazi") and any(root.glob("**/.ekstazi")):
+    if info["flags"].get("ekstazi") and info["flags"].get("ekstazi_seeded"):
         return _run_dynamic_java(
             root, [gradle, "-q", "test"], timeout,
             runner="gradle-ekstazi", sources=["ekstazi-dependency-rts"],
@@ -629,11 +698,22 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
                 "install": "Configure affectedTest with full-suite fallback disabled and make --explain succeed.",
             }
         payload = _run_dynamic_java(
-            root, [gradle, "-q", "affectedTest"], timeout,
+            root,
+            [
+                gradle, "--no-daemon", "-q", "-I",
+                inspection["init_script"], "affectedTest",
+            ],
+            timeout,
             runner="gradle-affected-test", sources=["gradle-affected-tests"],
             inventory_count=len(inventory), metadata=metadata,
         )
         payload["inspection"] = inspection
+        if _FULL_SUITE_RE.search(payload.get("summary") or ""):
+            payload.update({
+                "ok": False,
+                "full_suite_refused": True,
+                "summary": "affectedTest ignored the safety policy and reported FULL_SUITE",
+            })
         return payload
     native_jacoco = metadata["jacoco_per_test"]
     if native_jacoco.get("available") and native_jacoco.get("tests"):
@@ -710,7 +790,9 @@ def run_affected_tests(
         elif not info["tools"].get("pytest") and not _can_import_pytest():
             result = {"ok": False, "available": False, "runner": "pytest", "install": "pip install pytest pytest-testmon"}
         elif info["flags"].get("testmon"):
-            result = _run_pytest_testmon(root, python, timeout)
+            result = _run_pytest_testmon(
+                root, info["tools"].get("analysis-python") or python, timeout,
+            )
         else:
             result = (
                 _run_pytest_coverage_contexts(root, files, python, timeout)

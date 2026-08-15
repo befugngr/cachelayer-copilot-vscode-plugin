@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local stdio MCP: verify_edit, run_affected_tests, debug_failure.
+"""Local stdio MCP: verify_edit, run_affected_tests, prepare_tia, debug_failure.
 
 Launched by the editor from this file path. Workspace cwd is the user repo.
 No third-party packages required.
@@ -17,6 +17,7 @@ from critic import verify_edit
 from debug import debug_failure
 from protocol import serve
 from tia import run_affected_tests
+from tia_prepare import prepare_tia
 
 _VERIFY = {
     "name": "verify_edit",
@@ -81,6 +82,32 @@ _TIA = {
                 "default": False,
                 "description": "Return a dry-run RTS install/seed plan; never rewrites build files.",
             },
+        },
+    },
+}
+
+_PREPARE_TIA = {
+    "name": "prepare_tia",
+    "description": (
+        "Create real TIA baselines without editing pom.xml/build.gradle. status is read-only; "
+        "joern builds a cached Java CPG; jacoco creates one XML report per test; starts/ekstazi "
+        "run their official baseline goals. Full-test baselines require confirm_full_baseline=true."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["status", "jacoco", "starts", "ekstazi", "joern", "all"],
+                "default": "status",
+            },
+            "confirm_full_baseline": {
+                "type": "boolean",
+                "default": False,
+                "description": "Required for modes that may execute every test.",
+            },
+            "max_tests": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
+            "timeout": {"type": "integer", "minimum": 30, "maximum": 900, "default": 300},
         },
     },
 }
@@ -172,6 +199,17 @@ def _tia(changed_files=None, timeout=45, seed_rts=False, **_kw):
     )
 
 
+def _prepare_tia(
+    mode="status", confirm_full_baseline=False, max_tests=200, timeout=300, **_kw
+):
+    return prepare_tia(
+        mode=mode,
+        confirm_full_baseline=bool(confirm_full_baseline),
+        max_tests=max_tests,
+        timeout=timeout,
+    )
+
+
 def _debug(
     stack_trace="", test_output="", file=None, line=None, coverage_matrix=None,
     auto_coverage=True, timeout=45, failing_input="", repro=None, **_kw
@@ -193,6 +231,7 @@ def main() -> None:
     serve({
         "verify_edit": (_VERIFY, _verify),
         "run_affected_tests": (_TIA, _tia),
+        "prepare_tia": (_PREPARE_TIA, _prepare_tia),
         "debug_failure": (_DEBUG, _debug),
     })
 

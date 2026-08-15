@@ -13,9 +13,12 @@ except ImportError:
 
 _CACHE: dict[str, Any] | None = None
 _CACHE_ROOT: str | None = None
-_MAX_ARTIFACT_VISITS = 800
 _SKIP_ARTIFACT_DIRS = SKIP_PARTS | {
     ".idea", ".gradle", ".cache", ".m2", "vendor", "out",
+}
+_HARD_SKIP_ARTIFACT_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", ".tox",
+    "__pycache__", ".m2", "vendor",
 }
 
 
@@ -58,6 +61,12 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
 
     combined_java_build = (pom_text + "\n" + gradle_text).lower()
     py_sources = any(root.glob("*.py")) or any(root.glob("src/**/*.py"))
+    artifacts = _artifact_inventory(root)
+    analysis_python = (
+        which("cachelayer-analysis-python")
+        or which("python3")
+        or which("python")
+    )
     info = {
         "root": str(root),
         # Global pytest/mypy/ruff installs do not make a Java workspace Python.
@@ -67,6 +76,7 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
         "java": java,
         "maven": pom,
         "gradle": gradle,
+        "artifacts": artifacts,
         "tools": {
             "python3": which("python3") or which("python"),
             "pytest": which("pytest"),
@@ -83,14 +93,16 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
             "java": which("java"),
             "joern": which("joern"),
             "joern-slice": which("joern-slice"),
+            "joern-parse": which("joern-parse"),
             "flacoco": which("flacoco"),
             "gzoltar": which("gzoltar"),
             "coverage": which("coverage"),
+            "analysis-python": analysis_python,
         },
         "flags": {
             "tsconfig": tsconfig,
             "eslint_config": eslint_cfg,
-            "testmon": _has_testmon(root),
+            "testmon": _can_import("testmon") or _tool_can_import(analysis_python, "testmon"),
             "ekstazi": "ekstazi" in combined_java_build,
             "jacoco": "jacoco" in combined_java_build,
             "starts": "starts-maven-plugin" in combined_java_build,
@@ -99,12 +111,13 @@ def detect(cwd: str | None = None) -> dict[str, Any]:
                 "io.github.vedanthvdev.affectedtests" in combined_java_build
                 or "affectedtest" in combined_java_build
             ),
-            "ekstazi_seeded": _has_named_dir(root, ".ekstazi"),
-            "starts_seeded": _has_named_dir(root, ".starts"),
-            "joern_cpg": _has_named_file(root, "cpg.bin"),
-            "jacoco_per_test": _has_jacoco_per_test(root),
-            "scalpel": _can_import("scalpel"),
-            "coverage": _can_import("coverage"),
+            "ekstazi_seeded": bool(artifacts["ekstazi"]),
+            "starts_seeded": bool(artifacts["starts"]),
+            "joern_cpg": bool(artifacts["cpg"]),
+            "jacoco_per_test": bool(artifacts["jacoco_per_test"]),
+            "artifact_scan_complete": True,
+            "scalpel": _can_import("scalpel") or _tool_can_import(analysis_python, "scalpel"),
+            "coverage": _can_import("coverage") or _tool_can_import(analysis_python, "coverage"),
         },
     }
     _CACHE = info
@@ -119,97 +132,102 @@ def _can_import(mod: str) -> bool:
         return False
 
 
-def _has_testmon(root: Path) -> bool:
-    return _can_import("testmon")
-
-
-def _module_roots(root: Path) -> list[Path]:
-    """Root plus immediate child modules that look like Maven/Gradle projects."""
-    roots = [root]
+def _tool_can_import(python: str | None, module: str) -> bool:
+    if not python:
+        return False
     try:
-        children = sorted(root.iterdir())
-    except OSError:
-        return roots
-    for child in children:
-        if not child.is_dir() or child.name in _SKIP_ARTIFACT_DIRS or child.name.startswith("."):
+        import subprocess
+
+        result = subprocess.run(
+            [python, "-c", f"import {module}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _artifact_inventory(root: Path) -> dict[str, list[str]]:
+    """Find TIA artifacts in arbitrarily deep modules with one pruned full scan.
+
+    Dependency/VCS trees cannot contain project-owned RTS state. Build trees are
+    visited, but class/resource fan-out is pruned after checking their known
+    report locations. Extra non-standard roots can be supplied through
+    CACHELAYER_TIA_ARTIFACT_PATHS (os.pathsep-separated).
+    """
+    found: dict[str, list[str]] = {
+        "modules": [], "ekstazi": [], "starts": [], "cpg": [],
+        "jacoco_per_test": [],
+    }
+    scan_roots = [root]
+    for raw in os.environ.get("CACHELAYER_TIA_ARTIFACT_PATHS", "").split(os.pathsep):
+        if not raw:
             continue
-        if any((child / name).exists() for name in (
-            "pom.xml", "build.gradle", "build.gradle.kts",
-        )):
-            roots.append(child)
-        if len(roots) >= 40:
-            break
-    return roots
+        path = Path(raw).expanduser().resolve()
+        if path.is_dir() and path not in scan_roots:
+            scan_roots.append(path)
 
-
-def _has_named_dir(root: Path, name: str) -> bool:
-    for base in _module_roots(root):
-        candidate = base / name
-        if candidate.is_dir():
-            return True
-    visits = 0
-    for dirpath, dirnames, _filenames in os.walk(root):
-        visits += 1
-        if visits > _MAX_ARTIFACT_VISITS:
-            break
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _SKIP_ARTIFACT_DIRS and not d.startswith(".")
-        ]
-        if (Path(dirpath) / name).is_dir():
-            return True
-    return False
-
-
-def _has_named_file(root: Path, name: str) -> bool:
-    for base in _module_roots(root):
-        if (base / name).is_file():
-            return True
-    visits = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        visits += 1
-        if visits > _MAX_ARTIFACT_VISITS:
-            break
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _SKIP_ARTIFACT_DIRS and not d.startswith(".")
-        ]
-        if name in filenames:
-            return True
-    return False
-
-
-def _has_jacoco_per_test(root: Path) -> bool:
-    """Check common Maven/Gradle report folders only — never a full-tree ** glob."""
-    rel_dirs = (
-        Path("target") / "jacoco" / "per-test",
-        Path("target") / "jacoco" / "sessions",
-        Path("target") / "jacoco-per-test",
-        Path("build") / "jacoco" / "per-test",
-        Path("build") / "jacoco" / "sessions",
-        Path("build") / "jacoco-per-test",
-        Path("build") / "reports" / "jacoco" / "per-test",
-    )
-    for base in _module_roots(root):
-        for rel in rel_dirs:
-            folder = base / rel
-            if not folder.is_dir():
-                continue
+    seen: set[tuple[int, int]] = set()
+    for scan_root in scan_roots:
+        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False):
+            current = Path(dirpath)
             try:
-                for path in folder.iterdir():
-                    if path.is_file() and path.suffix.lower() == ".xml" and path.name != "jacoco.xml":
-                        return True
+                stat = current.stat()
             except OSError:
+                dirnames[:] = []
                 continue
-        jacoco = base / "target" / "jacoco"
-        if jacoco.is_dir():
-            try:
-                for path in jacoco.glob("session_*.xml"):
-                    if path.is_file():
-                        return True
-            except OSError:
-                pass
-    return False
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in seen:
+                dirnames[:] = []
+                continue
+            seen.add(identity)
+
+            if any(name in filenames for name in ("pom.xml", "build.gradle", "build.gradle.kts")):
+                found["modules"].append(_display_path(current, root))
+            if "cpg.bin" in filenames:
+                found["cpg"].append(_display_path(current / "cpg.bin", root))
+            if current.name == ".ekstazi":
+                found["ekstazi"].append(_display_path(current, root))
+                dirnames[:] = []
+                continue
+            if current.name == ".starts":
+                found["starts"].append(_display_path(current, root))
+                dirnames[:] = []
+                continue
+            if _is_per_test_jacoco_dir(current):
+                for name in filenames:
+                    if name.endswith(".xml") and name != "jacoco.xml":
+                        found["jacoco_per_test"].append(
+                            _display_path(current / name, root)
+                        )
+                        break
+
+            dirnames[:] = [
+                name for name in dirnames
+                if name not in _HARD_SKIP_ARTIFACT_DIRS
+            ]
+            if current.name in {"classes", "test-classes", "generated", "tmp"}:
+                dirnames[:] = []
+    return {key: list(dict.fromkeys(values)) for key, values in found.items()}
+
+
+def _is_per_test_jacoco_dir(path: Path) -> bool:
+    parts = tuple(part.lower() for part in path.parts)
+    return (
+        path.name.lower() in {"per-test", "sessions", "jacoco-per-test", "test-coverage"}
+        and any("jacoco" in part or part == "test-coverage" for part in parts)
+    ) or path.name.lower() == "jacoco"  # session_*.xml is checked below
+
+
+def _display_path(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return str(path)
 
 
 def _wrapper_or_path(root: Path, name: str) -> str | None:

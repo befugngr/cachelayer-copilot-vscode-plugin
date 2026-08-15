@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .tia_prepare import build_joern_cpg, joern_cpg_path
     from .util import SKIP_PARTS, run_cmd
 except ImportError:
+    from tia_prepare import build_joern_cpg, joern_cpg_path
     from util import SKIP_PARTS, run_cmd
 
 MAX_SCAN_FILES = 4000
@@ -205,8 +207,72 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
     }
 
 
-def native_rts_selection(root: Path, kind: str, inventory_count: int | None = None) -> dict[str, Any]:
-    """Estimate selected tests from native STARTS/Ekstazi artifacts."""
+def starts_selected_tests(output: str) -> list[str]:
+    """Parse the official ``starts:select`` AffectedTests log section."""
+    tests: list[str] = []
+    active = False
+    for raw in (output or "").splitlines():
+        line = re.sub(r"^\s*\[[A-Z]+\]\s*", "", raw).strip()
+        if "AffectedTests" in line and "*" in line:
+            active = True
+            continue
+        if active and line.startswith("*"):
+            break
+        if not active or not line or line.startswith("["):
+            continue
+        if re.fullmatch(r"(?:[a-zA-Z_$][\w$]*\.)*[A-Z][\w$]*(?:Test|Tests|IT)", line):
+            if line not in tests:
+                tests.append(line)
+    return tests[:MAX_TESTS]
+
+
+def ekstazi_non_affected_tests(output: str) -> list[str]:
+    """Parse the official ``ekstazi:predict`` NonAffected records."""
+    tests: list[str] = []
+    for value in re.findall(r"NonAffected::\s+([^\s]+)", output or ""):
+        test = value.removesuffix(".java").replace("/", ".").replace("\\", ".")
+        if test and test not in tests:
+            tests.append(test)
+    return tests[:MAX_TESTS]
+
+
+def native_rts_selection(
+    root: Path,
+    kind: str,
+    inventory_count: int | None = None,
+    *,
+    selector_output: str = "",
+    inventory: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read official selector output first, then native artifacts as fallback."""
+    if kind == "starts":
+        selected_tests = starts_selected_tests(selector_output)
+        if selected_tests or "AffectedTests" in selector_output:
+            selected = len(selected_tests)
+            return {
+                "available": True,
+                "tests": selected_tests,
+                "selected": selected,
+                "skipped_estimate": (
+                    max(0, inventory_count - selected)
+                    if inventory_count is not None else None
+                ),
+                "artifacts": [],
+                "source": "starts-select-goal",
+            }
+    elif selector_output and inventory is not None:
+        non_affected = set(ekstazi_non_affected_tests(selector_output))
+        if non_affected or "NonAffected::" in selector_output:
+            selected_tests = [test for test in inventory if test not in non_affected]
+            return {
+                "available": True,
+                "tests": selected_tests[:MAX_TESTS],
+                "selected": len(selected_tests),
+                "skipped_estimate": len(non_affected),
+                "artifacts": [],
+                "source": "ekstazi-predict-goal",
+            }
+
     base_name = ".starts" if kind == "starts" else ".ekstazi"
     bases = [path for path in root.glob(f"**/{base_name}") if path.is_dir()][:20]
     tests: list[str] = []
@@ -248,21 +314,14 @@ def native_rts_selection(root: Path, kind: str, inventory_count: int | None = No
 def rts_seed_plan(root: Path, info: dict[str, Any]) -> dict[str, Any]:
     """Return a non-mutating install/seed plan for Java RTS selectors."""
     flags = info.get("flags") or {}
+    inventory = info.get("artifacts") or {}
     maven = bool(info.get("maven"))
     gradle = bool(info.get("gradle"))
     artifacts = {
         "smart_test_picker_map": smart_test_picker_map(root),
-        "starts_database": next(
-            (path.relative_to(root).as_posix() for path in root.glob("**/.starts") if path.is_dir()),
-            None,
-        ),
-        "ekstazi_database": next(
-            (path.relative_to(root).as_posix() for path in root.glob("**/.ekstazi") if path.is_dir()),
-            None,
-        ),
-        "jacoco_per_test_reports": bool(
-            next((path for pattern in _PER_TEST_JACOCO_PATTERNS for path in root.glob(pattern) if path.is_file()), None)
-        ),
+        "starts_database": next(iter(inventory.get("starts") or []), None),
+        "ekstazi_database": next(iter(inventory.get("ekstazi") or []), None),
+        "jacoco_per_test_reports": bool(inventory.get("jacoco_per_test")),
     }
     options: list[dict[str, Any]] = []
     if maven:
@@ -327,34 +386,81 @@ def rts_seed_plan(root: Path, info: dict[str, Any]) -> dict[str, Any]:
 
 
 def joern_slice_selection(
-    root: Path, changed_files: list[str], joern_slice: str | None = None
+    root: Path,
+    changed_files: list[str],
+    joern_slice: str | None = None,
+    joern_parse: str | None = None,
 ) -> dict[str, Any]:
-    """Read or generate a bounded Joern usage/call slice."""
+    """Read or generate bounded Joern CPG usage and DDG slices."""
     path = next((root / rel for rel in _JOERN_OUTPUTS if (root / rel).is_file()), None)
     generated: tempfile.TemporaryDirectory[str] | None = None
     command_result: dict[str, Any] | None = None
-    cpg = next((candidate for candidate in root.glob("**/cpg.bin") if candidate.is_file()), None)
+    cpg_candidates = [
+        root / "cpg.bin", root / ".joern" / "cpg.bin",
+        root / "target" / "cpg.bin", root / "build" / "cpg.bin",
+        joern_cpg_path(root),
+    ]
+    cpg = next((candidate for candidate in cpg_candidates if candidate.is_file()), None)
+    cpg_build: dict[str, Any] | None = None
+    if path is None and cpg is None and joern_slice and joern_parse:
+        cpg_build = build_joern_cpg(root)
+        if cpg_build.get("ok") and cpg_build.get("artifact"):
+            cpg = Path(cpg_build["artifact"])
     if path is None and cpg is not None and joern_slice:
         cache = Path.home() / ".cache" / "cachelayer-toolchain"
         cache.mkdir(parents=True, exist_ok=True)
         generated = tempfile.TemporaryDirectory(prefix="tia-joern-", dir=cache)
-        path = Path(generated.name) / "slices.json"
-        command_result = run_cmd(
-            [joern_slice, "usages", "--out", str(path), str(cpg)],
-            cwd=root,
-            timeout=20,
+        output_base = Path(generated.name) / "slices"
+        file_filter = "|".join(
+            re.escape(Path(name).name) for name in changed_files[:30]
         )
-        if not command_result.get("ok") or not path.is_file():
+        usage = run_cmd(
+            [
+                joern_slice, "usages", "--parallelism", "1",
+                "--file-filter", file_filter, "--out", str(output_base), str(cpg),
+            ],
+            cwd=root, timeout=60, memory_mb=1536,
+        )
+        data_flow = run_cmd(
+            [
+                joern_slice, "data-flow", "--parallelism", "1",
+                "--slice-depth", "8", "--file-filter", file_filter,
+                "--out", str(output_base) + "-dataflow", str(cpg),
+            ],
+            cwd=root, timeout=60, memory_mb=1536,
+        )
+        command_result = {
+            "ok": bool(usage.get("ok")) or bool(data_flow.get("ok")),
+            "output": "\n".join(
+                str(item.get("output") or "") for item in (usage, data_flow)
+            ),
+        }
+        output_files = sorted(Path(generated.name).glob("*.json"))
+        if not command_result.get("ok") or not output_files:
             generated.cleanup()
             return {
                 "available": False, "tests": [],
-                "reason": "joern-slice failed; using bounded static type/import slice",
+                "reason": "Joern CPG slicing failed; using bounded static type/import slice",
                 "detail": str(command_result.get("output") or "")[-500:],
+                "cpg_build": cpg_build,
             }
+        merged: list[Any] = []
+        for output_file in output_files:
+            try:
+                value = json.loads(output_file.read_text(**_READ))
+            except (OSError, ValueError):
+                continue
+            merged.extend(
+                value if isinstance(value, list)
+                else value.get("slices", value.get("results", [value]))
+            )
+        path = Path(generated.name) / "merged.json"
+        path.write_text(json.dumps(merged), encoding="utf-8")
     if path is None:
         return {
             "available": False, "tests": [],
-            "reason": "no cpg.bin/joern-slice output; using bounded static type/import slice",
+            "reason": "Joern/CPG unavailable; using bounded static type/import slice",
+            "cpg_build": cpg_build,
         }
     try:
         if path.stat().st_size > 5_000_000:
@@ -385,8 +491,13 @@ def joern_slice_selection(
         "available": True,
         "tests": tests,
         "file": report_file,
-        "source": "joern-usage-call-slice",
-        "reason": "generated Joern usage slice" if command_result is not None else "existing Joern slice output",
+        "source": "joern-cpg-usage-dataflow-slice",
+        "reason": (
+            "generated Joern CPG usage and DDG slices"
+            if command_result is not None else "existing Joern slice output"
+        ),
+        "cpg": str(cpg) if cpg is not None else None,
+        "cpg_build": cpg_build,
     }
 
 
