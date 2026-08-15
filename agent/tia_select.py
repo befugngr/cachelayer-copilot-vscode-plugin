@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import tempfile
@@ -10,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .tia_prepare import build_joern_cpg, joern_cpg_path
+    from .tia_prepare import build_joern_cpg, jacoco_provenance, joern_cpg_path
     from .util import SKIP_PARTS, run_cmd
 except ImportError:
-    from tia_prepare import build_joern_cpg, joern_cpg_path
+    from tia_prepare import build_joern_cpg, jacoco_provenance, joern_cpg_path
     from util import SKIP_PARTS, run_cmd
 
 MAX_SCAN_FILES = 4000
@@ -39,12 +40,9 @@ _SMART_SELECTIONS = (
     "build/selected-tests.json",
     "target/selected-tests.json",
 )
-_PER_TEST_JACOCO_PATTERNS = (
-    "**/jacoco/session_*.xml",
-    "**/jacoco/sessions/*.xml",
-    "**/jacoco/per-test/*.xml",
-    "**/jacoco-per-test/*.xml",
-    "**/test-coverage/*.xml",
+_PER_TEST_JACOCO_MANIFESTS = (
+    "**/jacoco/per-test/manifest.json",
+    "**/jacoco-per-test/manifest.json",
 )
 _JOERN_OUTPUTS = (
     "joern-slices.json",
@@ -141,34 +139,57 @@ def _test_name_from_report(path: Path, report: ET.Element) -> str | None:
 
 
 def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str, Any]:
-    """Select tests from distinct per-test JaCoCo XML reports.
+    """Select tests only from manifest-labeled, fresh per-test JaCoCo reports.
 
-    A normal aggregate ``jacoco.xml`` is deliberately excluded. JaCoCo ``.exec``
-    is binary and does not identify tests unless a harness emitted distinct
-    sessions/reports, so opaque aggregate exec files are only reported as hints.
+    Filenames and XML attributes are not proof of ownership. The preparation
+    harness records each test's unique exec/XML pair and hashes in a sidecar.
     """
     changed = {_fq_class(rel) for rel in changed_files if Path(rel).suffix.lower() in (".java", ".kt", ".kts")}
     changed.discard("")
     if not changed:
         return {"available": False, "tests": [], "reason": "no changed Java classes"}
-    candidates: list[Path] = []
-    for pattern in _PER_TEST_JACOCO_PATTERNS:
-        for path in root.glob(pattern):
-            if path.is_file() and path.name != "jacoco.xml" and path not in candidates:
-                candidates.append(path)
-            if len(candidates) >= 200:
-                break
-        if len(candidates) >= 200:
-            break
+    current_provenance = jacoco_provenance(root)
     tests: list[str] = []
     parsed: list[str] = []
-    for path in candidates:
+    manifests: list[str] = []
+    rejected: list[str] = []
+    entries: list[tuple[str, Path]] = []
+    for pattern in _PER_TEST_JACOCO_MANIFESTS:
+        for manifest in list(root.glob(pattern))[:20]:
+            try:
+                payload = json.loads(manifest.read_text(**_READ))
+            except (OSError, ValueError):
+                rejected.append(f"{manifest.relative_to(root).as_posix()}: unreadable manifest")
+                continue
+            if (
+                payload.get("schema") != "cachelayer-jacoco-per-test-v1"
+                or payload.get("provenance") != current_provenance
+                or not isinstance(payload.get("tests"), dict)
+            ):
+                rejected.append(f"{manifest.relative_to(root).as_posix()}: stale or unknown manifest")
+                continue
+            manifests.append(manifest.relative_to(root).as_posix())
+            for test, item in list(payload["tests"].items())[:200]:
+                if not isinstance(item, dict):
+                    continue
+                exec_file = root / str(item.get("exec") or "")
+                xml_file = root / str(item.get("xml") or "")
+                try:
+                    valid = (
+                        exec_file.is_file() and xml_file.is_file()
+                        and hashlib.sha256(exec_file.read_bytes()).hexdigest() == item.get("exec_sha256")
+                        and hashlib.sha256(xml_file.read_bytes()).hexdigest() == item.get("xml_sha256")
+                    )
+                except OSError:
+                    valid = False
+                if valid:
+                    entries.append((str(test).split("#", 1)[0], xml_file))
+                else:
+                    rejected.append(f"{test}: missing or hash-mismatched exec/XML pair")
+    for test, path in entries:
         try:
             report = ET.parse(path).getroot()
         except (ET.ParseError, OSError):
-            continue
-        test = _test_name_from_report(path, report)
-        if not test:
             continue
         covered: set[str] = set()
         for cls in report.iter("class"):
@@ -190,20 +211,23 @@ def jacoco_per_test_selection(root: Path, changed_files: list[str]) -> dict[str,
         for path in list(root.glob("**/jacoco*.exec"))[:50] if path.is_file()
     ]
     if not parsed:
-        reason = "no distinct per-test JaCoCo XML/session reports"
+        reason = "no fresh manifest-labeled per-test JaCoCo exec/XML pairs"
         if exec_files:
             reason += "; aggregate/binary exec data cannot identify owning tests"
         return {
             "available": False, "tests": [], "reason": reason,
             "exec_files": exec_files,
-            "install": "Configure one JaCoCo XML report/session per test; aggregate jacoco.xml is validation only.",
+            "rejected": rejected[:50],
+            "install": "Run prepare_tia(jacoco) to create unique exec/XML pairs and their provenance manifest.",
         }
     return {
         "available": True,
         "tests": tests[:MAX_TESTS],
         "reports": parsed[:200],
-        "source": "jacoco-native-per-test-xml",
-        "reason": "per-test JaCoCo reports",
+        "manifests": manifests,
+        "rejected": rejected[:50],
+        "source": "jacoco-manifest-per-test-exec",
+        "reason": "fresh manifest-labeled per-test JaCoCo exec/XML pairs",
     }
 
 
@@ -233,7 +257,7 @@ def ekstazi_non_affected_tests(output: str) -> list[str]:
         test = value.removesuffix(".java").replace("/", ".").replace("\\", ".")
         if test and test not in tests:
             tests.append(test)
-    return tests[:MAX_TESTS]
+    return tests
 
 
 def native_rts_selection(
@@ -264,9 +288,10 @@ def native_rts_selection(
         non_affected = set(ekstazi_non_affected_tests(selector_output))
         if non_affected or "NonAffected::" in selector_output:
             selected_tests = [test for test in inventory if test not in non_affected]
+            selected_tests = selected_tests[:MAX_TESTS]
             return {
                 "available": True,
-                "tests": selected_tests[:MAX_TESTS],
+                "tests": selected_tests,
                 "selected": len(selected_tests),
                 "skipped_estimate": len(non_affected),
                 "artifacts": [],

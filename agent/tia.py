@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -345,6 +346,7 @@ def _java_result(
         "selection_sources": sources,
         "failures": cap_text(output, 2500) if not result.get("ok") else "",
         "summary": cap_text(selector_summary, 400),
+        "full_suite_reported": bool(_FULL_SUITE_RE.search(output)),
         "timed_out": bool(result.get("timeout")),
         "dynamic_selector": dynamic_selector,
         "jacoco_detected": bool(jacoco.get("configured")),
@@ -409,7 +411,7 @@ def _run_dynamic_java(
             root,
             native_kind,
             inventory_count,
-            selector_output=native_preview,
+            selector_output=native_preview or (result.get("output") or ""),
             inventory=inventory,
         )
         payload["native_selection"] = native
@@ -490,7 +492,7 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     starts_db = bool(info["flags"].get("starts_seeded"))
     if info["flags"].get("starts") and starts_db:
         preview = run_cmd(
-            [mvn, "-q", "-DupdateSelectChecksums=false", "starts:select"],
+            [mvn, "--no-transfer-progress", "-DupdateSelectChecksums=false", "starts:select"],
             cwd=root, timeout=min(timeout, 60),
         )
         return _run_dynamic_java(
@@ -504,7 +506,7 @@ def _run_maven(root: Path, info: dict[str, Any], files: list[str], timeout: int)
     ekstazi_db = bool(info["flags"].get("ekstazi_seeded"))
     if info["flags"].get("ekstazi") and ekstazi_db:
         preview = run_cmd(
-            [mvn, "-q", "ekstazi:predict"],
+            [mvn, "--no-transfer-progress", "ekstazi:predict"],
             cwd=root, timeout=min(timeout, 60),
         )
         return _run_dynamic_java(
@@ -595,9 +597,9 @@ def _affected_test_inspection(root: Path, gradle: str, timeout: int) -> dict[str
             continue
         if _FULL_SUITE_RE.search(text):
             remediated_build_files.append(build_name)
-    safety_dir = Path.home() / ".cache" / "cachelayer-toolchain" / "gradle"
-    safety_dir.mkdir(parents=True, exist_ok=True)
-    init_script = safety_dir / "cachelayer-affected-tests-safety.init.gradle"
+    fd, init_name = tempfile.mkstemp(prefix="cachelayer-affected-tests-", suffix=".init.gradle")
+    os.close(fd)
+    init_script = Path(init_name)
     init_script.write_text(
         """
 gradle.projectsEvaluated {
@@ -623,7 +625,10 @@ gradle.projectsEvaluated {
         encoding="utf-8",
     )
     inspection = run_cmd(
-        [gradle, "--no-daemon", "-q", "-I", str(init_script), "help", "--task", "affectedTest"],
+        [
+            gradle, "--no-daemon", "-q", "-I", str(init_script),
+            "affectedTest", "--explain", "--explain-format=json",
+        ],
         cwd=root,
         timeout=min(timeout, 120),
         memory_mb=None,
@@ -631,15 +636,75 @@ gradle.projectsEvaluated {
     )
     output = inspection.get("output") or ""
     if not inspection.get("ok"):
+        unsupported_json = re.search(
+            r"(?:unknown|unrecognized|unsupported).{0,80}explain-format"
+            r"|explain-format.{0,80}(?:unknown|unrecognized|unsupported)",
+            output,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if unsupported_json:
+            inspection = run_cmd(
+                [
+                    gradle, "--no-daemon", "-q", "-I", str(init_script),
+                    "affectedTest", "--explain",
+                ],
+                cwd=root, timeout=min(timeout, 120), memory_mb=None,
+                env=_bounded_java_env(),
+            )
+            output = inspection.get("output") or ""
+    if not inspection.get("ok"):
         return {
             "safe": False,
-            "reason": "affectedTest safety init script failed; execution was not attempted",
+            "reason": "affectedTest --explain failed with the safety init script",
             "output": output,
+            "init_script": str(init_script),
+        }
+    if _FULL_SUITE_RE.search(output):
+        return {
+            "safe": False,
+            "reason": "affectedTest --explain reported FULL_SUITE or ALL_TESTS",
+            "output": output,
+            "init_script": str(init_script),
+        }
+    statuses: list[str] = []
+    status_keys = {"status", "mode", "selectionstatus", "selection_status"}
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except ValueError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        for key, child in value.items():
+            if str(key).lower() in status_keys:
+                statuses.append(str(child).upper())
+        for container in ("selection", "result", "affectedTests", "affected_tests"):
+            child = value.get(container)
+            if not isinstance(child, dict):
+                continue
+            for key, status in child.items():
+                if str(key).lower() in status_keys:
+                    statuses.append(str(status).upper())
+    if not statuses:
+        match = re.search(r"\bAffected Tests:\s*([A-Z_]+)\b", output, re.IGNORECASE)
+        if match:
+            statuses.append(match.group(1).upper())
+    if "SELECTED" not in statuses:
+        return {
+            "safe": False,
+            "reason": "affectedTest --explain had an unknown or non-SELECTED schema/status",
+            "output": output,
+            "statuses": statuses,
+            "init_script": str(init_script),
         }
     return {
         "safe": True,
-        "reason": "runtime safety policy pins every fallback away from FULL_SUITE",
+        "reason": "affectedTest --explain explicitly reported SELECTED under runtime safety policy",
         "output": output,
+        "statuses": statuses,
         "init_script": str(init_script),
         "runtime_overrides": remediated_build_files,
     }
@@ -675,19 +740,24 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
         return payload
     if info["flags"].get("starts") and info["flags"].get("starts_seeded"):
         return _run_dynamic_java(
-            root, [gradle, "-q", "starts"], timeout,
+            root, [gradle, "starts"], timeout,
             runner="gradle-starts", sources=["starts-static-rts"],
             inventory_count=len(inventory), metadata=metadata, native_kind="starts",
+            inventory=inventory,
         )
     if info["flags"].get("ekstazi") and info["flags"].get("ekstazi_seeded"):
         return _run_dynamic_java(
-            root, [gradle, "-q", "test"], timeout,
+            root, [gradle, "test"], timeout,
             runner="gradle-ekstazi", sources=["ekstazi-dependency-rts"],
             inventory_count=len(inventory), metadata=metadata, native_kind="ekstazi",
+            inventory=inventory,
         )
     if info["flags"].get("affected_tests"):
         inspection = _affected_test_inspection(root, gradle, timeout)
         if not inspection["safe"]:
+            init_script = inspection.get("init_script")
+            if init_script:
+                Path(init_script).unlink(missing_ok=True)
             return {
                 "ok": False, "available": True, "runner": "gradle-affected-test",
                 "selected": 0, "tests": [], "skipped_estimate": len(inventory),
@@ -697,18 +767,21 @@ def _run_gradle(root: Path, info: dict[str, Any], files: list[str], timeout: int
                 "inspection": inspection,
                 "install": "Configure affectedTest with full-suite fallback disabled and make --explain succeed.",
             }
-        payload = _run_dynamic_java(
-            root,
-            [
-                gradle, "--no-daemon", "-q", "-I",
-                inspection["init_script"], "affectedTest",
-            ],
-            timeout,
-            runner="gradle-affected-test", sources=["gradle-affected-tests"],
-            inventory_count=len(inventory), metadata=metadata,
-        )
+        try:
+            payload = _run_dynamic_java(
+                root,
+                [
+                    gradle, "--no-daemon", "-q", "-I",
+                    inspection["init_script"], "affectedTest",
+                ],
+                timeout,
+                runner="gradle-affected-test", sources=["gradle-affected-tests"],
+                inventory_count=len(inventory), metadata=metadata,
+            )
+        finally:
+            Path(inspection["init_script"]).unlink(missing_ok=True)
         payload["inspection"] = inspection
-        if _FULL_SUITE_RE.search(payload.get("summary") or ""):
+        if payload.get("full_suite_reported"):
             payload.update({
                 "ok": False,
                 "full_suite_refused": True,

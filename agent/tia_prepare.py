@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,41 @@ def _cache_key(root: Path) -> str:
     return hashlib.sha256(raw).hexdigest()[:20]
 
 
+def jacoco_provenance(root: Path) -> dict[str, str]:
+    """Fingerprint inputs which can change per-test coverage ownership."""
+    digest = hashlib.sha256()
+    files: list[Path] = []
+    for name in (
+        "pom.xml", "build.gradle", "build.gradle.kts",
+        "settings.gradle", "settings.gradle.kts", "gradle.properties",
+    ):
+        files.extend(path for path in root.glob(f"**/{name}") if path.is_file())
+    for marker in ("src/main", "src/test"):
+        for base in root.glob(f"**/{marker}"):
+            if base.is_dir():
+                files.extend(
+                    path for path in base.rglob("*")
+                    if path.is_file() and path.suffix.lower() in {".java", ".kt", ".kts"}
+                )
+    for path in sorted(set(files)):
+        try:
+            rel = path.relative_to(root).as_posix()
+            digest.update(rel.encode())
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        except OSError:
+            continue
+    revision = run_cmd(
+        ["git", "rev-parse", "HEAD"], cwd=root, timeout=5, memory_mb=None,
+    ).get("output") or "working-tree"
+    return {
+        "root": str(root.resolve()),
+        "revision": str(revision).strip(),
+        "input_sha256": digest.hexdigest(),
+    }
+
+
 def joern_cpg_path(root: Path) -> Path:
     return TOOLCHAIN / "joern-cpg" / _cache_key(root) / "cpg.bin"
 
@@ -82,18 +117,79 @@ def build_joern_cpg(root: Path, timeout: int = 300) -> dict[str, Any]:
     }
 
 
-def _copy_jacoco_report(root: Path, test: str, destination: Path) -> bool:
-    candidates = (
-        root / "target" / "site" / "jacoco" / "jacoco.xml",
-        root / "build" / "reports" / "jacoco" / "test" / "jacocoTestReport.xml",
+def _safe_test_name(test: str) -> str:
+    return test.replace("$", "_").replace(".", "__").replace("#", "__")
+
+
+def _jacoco_cli(root: Path, mvn: str | None, timeout: int) -> Path | None:
+    candidates = [
+        TOOLCHAIN / f"org.jacoco.cli-{JACOCO_VERSION}-nodeps.jar",
+        Path.home() / ".m2" / "repository" / "org" / "jacoco" / "org.jacoco.cli"
+        / JACOCO_VERSION / f"org.jacoco.cli-{JACOCO_VERSION}-nodeps.jar",
+    ]
+    found = next((path for path in candidates if path.is_file()), None)
+    if found or not mvn:
+        return found
+    fetched = run_cmd(
+        [
+            mvn, "-q", "dependency:get",
+            f"-Dartifact=org.jacoco:org.jacoco.cli:{JACOCO_VERSION}:jar:nodeps",
+        ],
+        cwd=root, timeout=timeout, memory_mb=None, env=_bounded_java_env(),
     )
-    report = next((path for path in candidates if path.is_file()), None)
-    if report is None:
-        return False
-    destination.mkdir(parents=True, exist_ok=True)
-    safe = test.replace("$", "_").replace(".", "__").replace("#", "__")
-    shutil.copy2(report, destination / f"session_{safe}.xml")
-    return True
+    return candidates[1] if fetched.get("ok") and candidates[1].is_file() else None
+
+
+def _jacoco_report_from_exec(
+    root: Path,
+    exec_file: Path,
+    xml_file: Path,
+    cli: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    class_dirs = [
+        path for pattern in (
+            "**/target/classes", "**/build/classes/java/main",
+            "**/build/classes/kotlin/main",
+        )
+        for path in root.glob(pattern) if path.is_dir()
+    ]
+    source_dirs = [
+        path for pattern in ("**/src/main/java", "**/src/main/kotlin")
+        for path in root.glob(pattern) if path.is_dir()
+    ]
+    if not exec_file.is_file() or exec_file.stat().st_size == 0 or not class_dirs:
+        return {"ok": False, "output": "missing unique exec data or compiled classes"}
+    xml_file.parent.mkdir(parents=True, exist_ok=True)
+    xml_file.unlink(missing_ok=True)
+    java = which("java")
+    if not java:
+        return {"ok": False, "output": "java is unavailable"}
+    argv = [java, "-jar", str(cli), "report", str(exec_file)]
+    for path in class_dirs:
+        argv.extend(["--classfiles", str(path)])
+    for path in source_dirs:
+        argv.extend(["--sourcefiles", str(path)])
+    argv.extend(["--xml", str(xml_file)])
+    result = run_cmd(
+        argv, cwd=root, timeout=timeout, memory_mb=None, env=_bounded_java_env(),
+    )
+    result["ok"] = bool(result.get("ok")) and xml_file.is_file()
+    return result
+
+
+def _write_jacoco_manifest(
+    root: Path, destination: Path, entries: dict[str, dict[str, str]],
+) -> Path:
+    manifest = destination / "manifest.json"
+    payload = {
+        "schema": "cachelayer-jacoco-per-test-v1",
+        "jacoco_version": JACOCO_VERSION,
+        "provenance": jacoco_provenance(root),
+        "tests": entries,
+    }
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
 
 
 def seed_jacoco_per_test(
@@ -111,50 +207,108 @@ def seed_jacoco_per_test(
     failures: list[str] = []
     diagnostics: dict[str, str] = {}
     reports = 0
+    entries: dict[str, dict[str, str]] = {}
+    mvn = info.get("tools", {}).get("mvn")
+    cli = _jacoco_cli(root, mvn, timeout)
+    if not cli:
+        return {
+            "ok": False,
+            "reason": "JaCoCo CLI nodeps jar is unavailable; cannot derive XML from unique exec files",
+        }
     if info.get("maven"):
-        mvn = info["tools"].get("mvn")
         if not mvn:
             return {"ok": False, "reason": "Maven is unavailable"}
         destination = root / "target" / "jacoco" / "per-test"
+        exec_dir = root / "target" / "jacoco" / "per-test-exec"
         for test in tests:
-            exec_file = root / "target" / "jacoco" / "per-test-exec" / f"{test}.exec"
+            safe = _safe_test_name(test)
+            exec_file = exec_dir / f"{safe}.exec"
+            xml_file = destination / f"session_{safe}.xml"
             exec_file.parent.mkdir(parents=True, exist_ok=True)
             exec_file.unlink(missing_ok=True)
             result = run_cmd(
                 [
                     mvn, "-q", f"-Dtest={test}", "-DfailIfNoTests=false",
                     f"-Djacoco.destFile={exec_file}",
-                    f"-Djacoco.dataFile={exec_file}",
+                    "-Djacoco.append=false",
                     f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}:prepare-agent",
                     "test",
-                    f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}:report",
                 ],
                 cwd=root, timeout=timeout, memory_mb=None,
                 env=_bounded_java_env(),
             )
-            if not result.get("ok") or not _copy_jacoco_report(root, test, destination):
+            report = (
+                _jacoco_report_from_exec(root, exec_file, xml_file, cli, timeout)
+                if result.get("ok") else result
+            )
+            if not report.get("ok"):
                 failures.append(test)
-                diagnostics[test] = str(result.get("output") or "")[-1000:]
+                diagnostics[test] = str(report.get("output") or "")[-1000:]
             else:
                 reports += 1
+                entries[test] = {
+                    "exec": exec_file.relative_to(root).as_posix(),
+                    "xml": xml_file.relative_to(root).as_posix(),
+                    "exec_sha256": hashlib.sha256(exec_file.read_bytes()).hexdigest(),
+                    "xml_sha256": hashlib.sha256(xml_file.read_bytes()).hexdigest(),
+                }
     elif info.get("gradle"):
         gradle = info["tools"].get("gradle")
         if not gradle:
             return {"ok": False, "reason": "Gradle is unavailable"}
         destination = root / "build" / "jacoco" / "per-test"
+        exec_dir = root / "build" / "jacoco" / "per-test-exec"
         for test in tests:
-            result = run_cmd(
-                [gradle, "--no-daemon", "-q", "test", "--tests", test, "jacocoTestReport"],
-                cwd=root, timeout=timeout, memory_mb=None,
-                env=_bounded_java_env(),
+            safe = _safe_test_name(test)
+            exec_file = exec_dir / f"{safe}.exec"
+            xml_file = destination / f"session_{safe}.xml"
+            exec_file.parent.mkdir(parents=True, exist_ok=True)
+            exec_file.unlink(missing_ok=True)
+            fd, init_name = tempfile.mkstemp(prefix="cachelayer-jacoco-", suffix=".init.gradle")
+            os.close(fd)
+            init_script = Path(init_name)
+            init_script.write_text(
+                """
+allprojects {
+    plugins.withId("java") {
+        apply plugin: "jacoco"
+        tasks.withType(Test).configureEach {
+            jacoco.destinationFile = file(System.getProperty("cachelayer.jacoco.dest"))
+        }
+    }
+}
+""".strip() + "\n",
+                encoding="utf-8",
             )
-            if not result.get("ok") or not _copy_jacoco_report(root, test, destination):
+            try:
+                result = run_cmd(
+                    [
+                        gradle, "--no-daemon", "-q", "-I", str(init_script),
+                        f"-Dcachelayer.jacoco.dest={exec_file}", "test", "--tests", test,
+                    ],
+                    cwd=root, timeout=timeout, memory_mb=None,
+                    env=_bounded_java_env(),
+                )
+            finally:
+                init_script.unlink(missing_ok=True)
+            report = (
+                _jacoco_report_from_exec(root, exec_file, xml_file, cli, timeout)
+                if result.get("ok") else result
+            )
+            if not report.get("ok"):
                 failures.append(test)
-                diagnostics[test] = str(result.get("output") or "")[-1000:]
+                diagnostics[test] = str(report.get("output") or "")[-1000:]
             else:
                 reports += 1
+                entries[test] = {
+                    "exec": exec_file.relative_to(root).as_posix(),
+                    "xml": xml_file.relative_to(root).as_posix(),
+                    "exec_sha256": hashlib.sha256(exec_file.read_bytes()).hexdigest(),
+                    "xml_sha256": hashlib.sha256(xml_file.read_bytes()).hexdigest(),
+                }
     else:
         return {"ok": False, "reason": "no Maven or Gradle project detected"}
+    manifest = _write_jacoco_manifest(root, destination, entries)
     return {
         "ok": not failures and reports == len(tests),
         "tests": len(tests),
@@ -162,6 +316,7 @@ def seed_jacoco_per_test(
         "failures": failures[:50],
         "diagnostics": diagnostics,
         "artifact": str(destination),
+        "manifest": str(manifest),
         "source": "jacoco-explicit-per-test-baseline",
     }
 
