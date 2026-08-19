@@ -21,8 +21,6 @@ Add these to your **User** `settings.json` (Command Palette → **Preferences: O
 
 Both are required. Without `extensions.autoUpdate`, VS Code will not pull plugin updates from GitHub (checked about every 24 hours). On VS Code 1.124 and earlier, use `"extensions.autoUpdate": true` instead of `"on"`.
 
-Copy-paste template: [`docs/vscode-user-settings.json`](docs/vscode-user-settings.json)
-
 ## 2. Install the plugin from GitHub
 
 1. Open Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
