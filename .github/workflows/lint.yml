@@ -13,7 +13,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, sys
-          for p in ["plugin.json", ".mcp.json", "hooks.json"]:
+          for p in ["plugin.json", ".mcp.json", "hooks.json", "docs/vscode-user-settings.json"]:
               with open(p) as f:
                   json.load(f)
               print(f"OK json {p}")
