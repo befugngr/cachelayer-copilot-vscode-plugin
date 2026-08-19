@@ -30,7 +30,7 @@ CODE_EXTS = {
 RISK_CONFIG_NAMES = {
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
     "settings.gradle.kts", "package.json", "pytest.ini", "pyproject.toml",
-    "setup.cfg", "tox.ini",
+    "setup.cfg", "tox.ini", "tsconfig.json",
 }
 
 SKIP_PARTS = {

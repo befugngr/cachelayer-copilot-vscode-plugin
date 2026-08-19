@@ -21,7 +21,14 @@
         "type": "command",
         "matcher": "Edit|Write|ApplyPatch|MultiEdit|NotebookEdit|create|edit|apply_patch|create_file|edit_file|write_file|patch_file|str_replace_editor|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
         "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
-        "timeout": 15,
+        "timeout": 45,
+        "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
+      },
+      {
+        "type": "command",
+        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command",
+        "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
+        "timeout": 45,
         "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
       }
     ]

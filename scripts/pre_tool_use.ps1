@@ -1,64 +1,85 @@
-# CacheLayer PreToolUse hook for GitHub Copilot / VS Code (Windows, fail-open).
-# Env: CACHELAYER_KEY (legacy CACHELAYER_TOKEN / CACHELAYER_CONNECT_TOKEN accepted)
+# CacheLayer PreToolUse hook for GitHub Copilot / VS Code (Windows, fail-open, visible).
 $ErrorActionPreference = 'SilentlyContinue'
 $Url = if ($env:CACHELAYER_HOOK_URL) { $env:CACHELAYER_HOOK_URL } else { 'https://api.cachelayer.org/hooks/pre-tool-use' }
 $Token = if ($env:CACHELAYER_KEY) { $env:CACHELAYER_KEY } elseif ($env:CACHELAYER_TOKEN) { $env:CACHELAYER_TOKEN } elseif ($env:CACHELAYER_CONNECT_TOKEN) { $env:CACHELAYER_CONNECT_TOKEN } else { '' }
 $TimeoutSec = 5
 if ($env:CACHELAYER_HOOK_TIMEOUT_S) { [void][int]::TryParse($env:CACHELAYER_HOOK_TIMEOUT_S, [ref]$TimeoutSec) }
 
-$InputJson = [Console]::In.ReadToEnd()
-if ([string]::IsNullOrWhiteSpace($InputJson) -or $InputJson.Length -gt 262144) {
-  Write-Output '{"continue":true}'
-  exit 0
+function Write-Allow([string]$Reason) {
+  Write-Output (@{
+    continue = $true
+    hookSpecificOutput = @{
+      hookEventName = 'PreToolUse'
+      permissionDecision = 'allow'
+      permissionDecisionReason = $Reason
+      additionalContext = "CacheLayer lookup: $Reason"
+    }
+  } | ConvertTo-Json -Compress -Depth 8)
 }
 
+$InputJson = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($InputJson) -or $InputJson.Length -gt 262144) {
+  Write-Allow 'empty_or_too_large'
+  exit 0
+}
 if ([string]::IsNullOrWhiteSpace($Token)) {
-  Write-Output '{"continue":true,"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"cachelayer_no_token"}}'
+  Write-Allow 'no_token'
   exit 0
 }
 
 $Filter = Join-Path $PSScriptRoot 'filter_hook_payload.py'
-if (Get-Command py -ErrorAction SilentlyContinue) {
-  $InputJson = $InputJson | py -3 $Filter
-} elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
-  $InputJson = $InputJson | python3 $Filter
-} elseif (Get-Command python -ErrorAction SilentlyContinue) {
-  $InputJson = $InputJson | python $Filter
-} else {
-  Write-Output '{"continue":true}'
+$PyCmd = $null
+$PyArgs = @()
+if (Get-Command py -ErrorAction SilentlyContinue) { $PyCmd = 'py'; $PyArgs = @('-3', $Filter) }
+elseif (Get-Command python3 -ErrorAction SilentlyContinue) { $PyCmd = 'python3'; $PyArgs = @($Filter) }
+elseif (Get-Command python -ErrorAction SilentlyContinue) { $PyCmd = 'python'; $PyArgs = @($Filter) }
+else {
+  Write-Allow 'no_python'
   exit 0
 }
+$InputJson = $InputJson | & $PyCmd @PyArgs
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($InputJson)) {
-  Write-Output '{"continue":true}'
+  Write-Allow 'skipped_non_read_or_secret'
   exit 0
 }
 
 try {
-  $headers = @{
-    'Content-Type'  = 'application/json'
+  $resp = Invoke-RestMethod -Method Post -Uri $Url -Headers @{
+    'Content-Type' = 'application/json'
     'Authorization' = "Bearer $Token"
-  }
-  $resp = Invoke-RestMethod -Method Post -Uri $Url -Headers $headers -Body $InputJson -TimeoutSec $TimeoutSec
+  } -Body $InputJson -TimeoutSec $TimeoutSec
   $hso = @{
-    hookEventName         = 'PreToolUse'
-    permissionDecision    = 'allow'
+    hookEventName = 'PreToolUse'
+    permissionDecision = 'allow'
     permissionDecisionReason = 'cache_miss'
   }
-  if ($resp.hookSpecificOutput) {
-    $hso = $resp.hookSpecificOutput
-  }
-  if ($resp.cachelayer -and $resp.cachelayer.hit -and $null -ne $resp.cachelayer.result) {
-    $rendered = if ($resp.cachelayer.result -is [string]) { $resp.cachelayer.result } else { ($resp.cachelayer.result | ConvertTo-Json -Compress -Depth 20) }
-    if (-not $hso.additionalContext) {
-      $hso | Add-Member -NotePropertyName additionalContext -NotePropertyValue ("CacheLayer reusable result for this step: " + $rendered) -Force
-    }
+  if ($resp.hookSpecificOutput) { $hso = @{} + $resp.hookSpecificOutput }
+  $cl = $resp.cachelayer
+  $err = $resp.error
+  if (-not $err -and $cl) { $err = $cl.error }
+  $hit = [bool]$resp.hit
+  if (-not $hit -and $cl) { $hit = [bool]$cl.hit }
+  $result = $resp.result
+  if ($null -eq $result -and $cl) { $result = $cl.result }
+  if ($err) {
+    $hso.permissionDecision = 'allow'
+    $hso.permissionDecisionReason = [string]$err
+    $hso.additionalContext = "CacheLayer lookup error: $err"
+  } elseif ($hit -and $null -ne $result) {
+    $rendered = if ($result -is [string]) { $result } else { ($result | ConvertTo-Json -Compress -Depth 20) }
+    $hso.permissionDecision = 'deny'
     $hso.permissionDecisionReason = 'cache_hit'
+    $hso.additionalContext = "CacheLayer HIT. Use this cached result and do not re-read:`n$rendered"
+  } else {
+    $hso.permissionDecision = 'allow'
+    $hso.permissionDecisionReason = 'cache_miss'
+    $hso.additionalContext = 'CacheLayer MISS. Native read will run; post-hook will try to save.'
   }
   $out = @{ continue = $true; hookSpecificOutput = $hso }
-  if ($resp.cachelayer) { $out.cachelayer = $resp.cachelayer }
+  if ($cl) { $out.cachelayer = $cl }
   Write-Output ($out | ConvertTo-Json -Compress -Depth 30)
   exit 0
 } catch {
-  Write-Output '{"continue":true}'
+  Write-Allow "lookup_unreachable"
   exit 0
 }

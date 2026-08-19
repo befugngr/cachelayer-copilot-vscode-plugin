@@ -61,6 +61,11 @@ def main() -> int:
     tool_name = str(body.get("tool_name") or body.get("toolName") or body.get("tool") or "")
     if not READ_TOOLS.fullmatch(tool_name):
         return 3
+    if "result" not in body:
+        for key in ("tool_response", "toolResponse", "tool_output", "toolOutput", "output"):
+            if key in body and body.get(key) not in (None, ""):
+                body["result"] = body[key]
+                break
     tool_input = body.get("tool_input") or body.get("toolInput") or body.get("input") or {}
     try:
         if SECRET_PATH.search(json.dumps(tool_input, default=str)):
@@ -69,6 +74,9 @@ def main() -> int:
         return 3
     sanitized = json.dumps(_redact(body), separators=(",", ":"), default=str)
     if len(sanitized.encode()) > MAX_BODY:
+        return 3
+    result = body.get("result")
+    if result in (None, "", {}, []):
         return 3
     sys.stdout.write(sanitized)
     return 0

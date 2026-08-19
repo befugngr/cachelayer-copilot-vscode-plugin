@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-open CRITIC hook: fast per-file by default, explicit coherent full gate."""
+"""Fail-open CRITIC/TIA/debug hook for Copilot: coherent gate after code edits."""
 from __future__ import annotations
 
 import json
@@ -9,12 +9,14 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from verify_edit import verify_edit
+from debug_failure import debug_failure
 from process_util import is_code_path
 
 EMPTY = "{}"
@@ -33,6 +35,12 @@ _DEDUP_SECONDS = 30
 _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update)\s+File:\s*(.+?)\s*$", re.MULTILINE)
 
 
+_TERMINAL_ALIASES = {
+    "run_in_terminal", "runinterminal", "bash", "shell", "powershell",
+    "execute_command", "run_command", "runcommand",
+}
+
+
 def _is_edit_tool(name: str) -> bool:
     n = name.strip().lower().replace("-", "_")
     compact = n.replace("_", "")
@@ -41,6 +49,12 @@ def _is_edit_tool(name: str) -> bool:
     if any(bad in n for bad in _NEVER):
         return False
     return n in _EDIT_ALIASES or compact in _EDIT_ALIASES
+
+
+def _is_terminal_tool(name: str) -> bool:
+    n = name.strip().lower().replace("-", "_")
+    compact = n.replace("_", "")
+    return n in _TERMINAL_ALIASES or compact in _TERMINAL_ALIASES
 
 
 def _tool_input(payload: dict) -> dict | str:
@@ -77,8 +91,7 @@ def normalize_payload(payload: dict) -> dict:
             "invocation_id", "invocationId", "event_id",
         ) if isinstance(payload.get(key), str) and payload.get(key)
     ), "")
-    mode = payload.get("critic_mode") or payload.get("criticMode")
-    full_gate = mode == "coherent" or payload.get("full_gate") is True or payload.get("fullGate") is True
+    full_gate = True
     return {
         "tool_name": name if isinstance(name, str) else "",
         "tool_input": inp,
@@ -192,6 +205,92 @@ def _line_range(payload: dict) -> list[int] | None:
     return None
 
 
+def _failure_blob(payload: dict, inp: dict | str) -> str:
+    chunks: list[str] = []
+    for key in ("tool_response", "toolResponse", "tool_output", "toolOutput", "output", "result", "error"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            chunks.append(v.strip())
+        elif isinstance(v, dict):
+            chunks.append(json.dumps(v, default=str)[:8000])
+    if isinstance(inp, dict):
+        for key in ("stdout", "stderr", "output", "error"):
+            v = inp.get(key)
+            if isinstance(v, str) and v.strip():
+                chunks.append(v.strip())
+    return "\n".join(chunks)
+
+
+def _exit_code(payload: dict, inp: dict | str) -> int | None:
+    sources: list[Any] = [payload]
+    if isinstance(inp, dict):
+        sources.append(inp)
+    resp = payload.get("tool_response") or payload.get("toolResponse")
+    if isinstance(resp, dict):
+        sources.append(resp)
+    for src in sources:
+        for key in ("exit_code", "exitCode", "status_code", "statusCode", "status", "code"):
+            v = src.get(key)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.lstrip("-").isdigit():
+                return int(v)
+    return None
+
+
+def _terminal_failed(payload: dict, inp: dict | str, blob: str) -> bool:
+    code = _exit_code(payload, inp)
+    if code not in (None, 0):
+        return True
+    low = blob.lower()
+    if "cancelled" in low and "error ts" not in low:
+        return False
+    return bool(re.search(
+        r"error TS\d+|npm ERR!|ERR!|AssertionError|FAILED|Traceback \(most recent call last\)|"
+        r"Could not read package\.json|is not assignable to",
+        blob,
+    ))
+
+
+def _verify_summary(result: dict) -> str:
+    if result.get("skipped"):
+        return f"CacheLayer verify_edit skipped: {result.get('reason') or 'no checker'}"
+    tests = next((g for g in (result.get("gates") or []) if g.get("name") == "tests"), {})
+    tia = tests.get("tia") or {}
+    lines = [
+        f"CacheLayer verify_edit mode={result.get('mode')} ok={result.get('ok')} "
+        f"blocked={result.get('blocked')} tests_ran={result.get('tests_ran')}",
+    ]
+    if tia:
+        lines.append(
+            f"TIA selected={tia.get('selected')} skipped={tia.get('skipped_estimate')} "
+            f"runner={tia.get('runner')}"
+        )
+    elif tests.get("skipped"):
+        lines.append(f"TIA skipped: {tests.get('reason') or tests.get('install') or 'not run'}")
+    feedback = result.get("feedback") or {}
+    if result.get("blocked"):
+        bits = []
+        for g in result.get("gates") or []:
+            if g.get("ok") or g.get("skipped"):
+                continue
+            if g.get("output"):
+                bits.append(f"{g.get('name')}:\n{g['output']}")
+        if bits:
+            lines.extend(bits)
+        lines.append(
+            f"Corrective protocol: {feedback.get('instruction') or 'Make one coherent corrective edit.'}"
+        )
+        lines.append(
+            f"cycle_id={feedback.get('cycle_id', '')} "
+            f"attempt={feedback.get('attempt', 0)}/{feedback.get('max_retries', 0)} "
+            f"next_action={feedback.get('action', 'stop_and_report')}"
+        )
+    return "\n".join(lines)
+
+
 def _emit(msg: str, payload: dict) -> None:
     fmt = (os.environ.get("CACHELAYER_HOOK_FORMAT") or "").strip().lower()
     if not fmt:
@@ -208,6 +307,21 @@ def _emit(msg: str, payload: dict) -> None:
     }))
 
 
+def _run_debug(payload: dict, normalized: dict) -> None:
+    inp = normalized["tool_input"]
+    blob = _failure_blob(payload, inp)
+    if not _terminal_failed(payload, inp, blob):
+        print(EMPTY)
+        return
+    cwd = normalized["cwd"]
+    try:
+        result = debug_failure(stack_trace=blob[:12000], test_output="", cwd=cwd)
+    except Exception as exc:
+        _emit(f"CacheLayer debug_failure error: {type(exc).__name__}: {exc}", payload)
+        return
+    _emit("CacheLayer debug_failure\n" + json.dumps(result, default=str)[:6000], payload)
+
+
 def main() -> None:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -215,8 +329,13 @@ def main() -> None:
         return
     try:
         payload = json.loads(raw)
-    except Exception:
-        print(EMPTY)
+    except Exception as exc:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": f"CacheLayer hook JSON error: {exc}",
+            }
+        }))
         return
     if not isinstance(payload, dict):
         print(EMPTY)
@@ -224,8 +343,9 @@ def main() -> None:
 
     normalized = normalize_payload(payload)
     tool_name = normalized["tool_name"]
-    # Unknown tool names remain compatible with older Cursor payloads only
-    # when a concrete code path is present. Named tools must be allowlisted.
+    if _is_terminal_tool(tool_name):
+        _run_debug(payload, normalized)
+        return
     if tool_name and not _is_edit_tool(tool_name):
         print(EMPTY)
         return
@@ -245,41 +365,17 @@ def main() -> None:
         result = verify_edit(
             paths=paths,
             line_range=_line_range(normalized_payload) if len(paths) == 1 else None,
-            run_tests=bool(normalized["full_gate"]),
+            run_tests=True,
             hook=True,
             cwd=cwd,
-            mode="coherent" if normalized["full_gate"] else "fast",
+            mode="coherent",
             edit_cycle_id=normalized["cycle_id"] or None,
         )
-    except Exception:
-        print(EMPTY)
+    except Exception as exc:
+        _emit(f"CacheLayer verify_edit error: {type(exc).__name__}: {exc}", payload)
         return
 
-    if result.get("skipped") or result.get("ok") or not result.get("blocked"):
-        print(EMPTY)
-        return
-
-    bits = []
-    for g in result.get("gates") or []:
-        if g.get("ok") or g.get("skipped"):
-            continue
-        if g.get("output"):
-            bits.append(f"{g.get('name')}:\n{g['output']}")
-    if not bits:
-        print(EMPTY)
-        return
-
-    feedback = result.get("feedback") or {}
-    corrective = feedback.get("instruction") or "Make one coherent corrective edit."
-    _emit(
-        "CRITIC (local, no extra LLM call): checks found errors after your edit. "
-        "The hook did not modify code.\n\n" + "\n\n".join(bits)
-        + f"\n\nCorrective protocol: {corrective}"
-        + f"\ncycle_id={feedback.get('cycle_id', '')} "
-        + f"attempt={feedback.get('attempt', 0)}/{feedback.get('max_retries', 0)} "
-        + f"next_action={feedback.get('action', 'stop_and_report')}",
-        payload,
-    )
+    _emit(_verify_summary(result), payload)
 
 
 if __name__ == "__main__":
