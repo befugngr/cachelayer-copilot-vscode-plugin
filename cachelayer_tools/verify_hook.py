@@ -16,6 +16,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from verify_edit import verify_edit
+from affected_tests import run_affected_tests
 from debug_failure import debug_failure
 from process_util import is_code_path
 
@@ -32,6 +33,12 @@ _EDIT_ALIASES = {
 _NEVER = ("todo", "plan", "search", "fetch", "read", "grep", "glob", "view", "list", "mcp", "shell", "bash")
 _DEDUP_SECONDS = 30
 
+_FULL_SUITE_RE = re.compile(
+    r"(?:^|[\s;&|])(?:npm\s+(?:(?:run\s+)?test)|npx\s+(?:jest|vitest|mocha)(?!\s+\S)|"
+    r"yarn\s+test|pnpm\s+test|python(?:3)?\s+-m\s+pytest(?:\s*$)|pytest(?:\s*$)|"
+    r"mvn\s+test|gradle(?:w)?\s+test)(?:\s|$)",
+    re.I,
+)
 _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update)\s+File:\s*(.+?)\s*$", re.MULTILINE)
 
 
@@ -49,6 +56,18 @@ def _is_edit_tool(name: str) -> bool:
     if any(bad in n for bad in _NEVER):
         return False
     return n in _EDIT_ALIASES or compact in _EDIT_ALIASES
+
+
+def _hook_event(payload: dict) -> str:
+    return str(payload.get("hook_event_name") or payload.get("hookEventName") or "").lower()
+
+
+def _command_text(inp: dict | str) -> str:
+    if isinstance(inp, str):
+        return inp
+    if isinstance(inp, dict):
+        return str(inp.get("command") or inp.get("cmd") or inp.get("input") or "")
+    return ""
 
 
 def _is_terminal_tool(name: str) -> bool:
@@ -291,7 +310,32 @@ def _verify_summary(result: dict) -> str:
     return "\n".join(lines)
 
 
-def _emit(msg: str, payload: dict) -> None:
+def _run_tia_instead_of_full_suite(payload: dict, normalized: dict) -> None:
+    cmd = _command_text(normalized["tool_input"])
+    if not _FULL_SUITE_RE.search(cmd):
+        print(EMPTY)
+        return
+    cwd = normalized["cwd"]
+    try:
+        affected = run_affected_tests(changed_files=None, cwd=cwd, timeout=40)
+    except Exception as exc:
+        _emit(
+            f"CacheLayer TIA error (full suite blocked): {type(exc).__name__}: {exc}",
+            payload,
+            event="PreToolUse",
+            deny=True,
+        )
+        return
+    _emit(
+        "CacheLayer blocked the full test suite. TIA result (do not re-run npm test):\n"
+        + json.dumps(affected, default=str)[:6000],
+        payload,
+        event="PreToolUse",
+        deny=True,
+    )
+
+
+def _emit(msg: str, payload: dict, event: str = "PostToolUse", deny: bool = False) -> None:
     fmt = (os.environ.get("CACHELAYER_HOOK_FORMAT") or "").strip().lower()
     if not fmt:
         cursor_keys = ("workspace_roots", "conversation_id", "generation_id")
@@ -300,10 +344,13 @@ def _emit(msg: str, payload: dict) -> None:
         print(json.dumps({"additional_context": msg}))
         return
     print(json.dumps({
+        "continue": True,
         "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
+            "hookEventName": event,
+            "permissionDecision": "deny" if deny else "allow",
+            "permissionDecisionReason": "tia_full_suite" if deny else "ok",
             "additionalContext": msg,
-        }
+        },
     }))
 
 
@@ -344,6 +391,9 @@ def main() -> None:
     normalized = normalize_payload(payload)
     tool_name = normalized["tool_name"]
     if _is_terminal_tool(tool_name):
+        if _hook_event(payload).startswith("pre"):
+            _run_tia_instead_of_full_suite(payload, normalized)
+            return
         _run_debug(payload, normalized)
         return
     if tool_name and not _is_edit_tool(tool_name):

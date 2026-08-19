@@ -3,16 +3,23 @@
     "PreToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|mcp__.+__(read|grep|glob|search|fetch).*",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|run_in_terminal|execute_command|run_command|Shell|Bash|Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|mcp__.+__(read|grep|glob|search|fetch).*",
         "command": "bash \"${PLUGIN_ROOT}/scripts/pre_tool_use.sh\"",
         "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\pre_tool_use.ps1\"",
         "timeout": 3
+      },
+      {
+        "type": "command",
+        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command",
+        "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
+        "timeout": 45,
+        "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
       }
     ],
     "PostToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|mcp__.+__(read|grep|glob|search|fetch).*",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|run_in_terminal|execute_command|run_command|Shell|Bash|mcp__.+__(read|grep|glob|search|fetch).*",
         "command": "bash \"${PLUGIN_ROOT}/scripts/post_tool_use.sh\"",
         "timeout": 3,
         "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\post_tool_use.ps1\""

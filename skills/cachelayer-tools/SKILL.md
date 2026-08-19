@@ -21,11 +21,15 @@ If `tsc`, tests, or a terminal command fails, call `debug_failure` once with the
 
 ## Before risky writes
 
-Call `check_conflict`. Keep one `run_id` per task.
+The pre-edit hook runs `check_conflict`. If it reports UNSAFE, do not apply the same mutation again.
+
+## Full test suites
+
+Do not run `npm test` / bare `pytest` first. The pre-terminal hook blocks a full suite and returns TIA (`run_affected_tests`). Use that result.
 
 ## Remote cache MCP
 
-Use `run_status` after interruption. Use `lookup_step` / `save_step` only for expensive reuse the hooks missed. Descriptors: lowercase verb + target (`read file <path>`, `run command <cmd>`).
+Use `run_status` after interruption. Hooks lookup/save reads and successful command results. Use `lookup_step` / `save_step` only if a hook miss is visible and the step is expensive. Descriptors: lowercase verb + target (`read file <path>`, `run command <cmd>`). Keep one `run_id` per task.
 
 ## Do not
 

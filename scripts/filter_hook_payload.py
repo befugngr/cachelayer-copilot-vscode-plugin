@@ -23,10 +23,15 @@ SECRET_VALUE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     re.S,
 )
-READ_TOOLS = re.compile(
+STEP_TOOLS = re.compile(
     r"^(?:read(?:_file)?|readfile|view|open_file|list_dir|"
     r"grep(?:_search)?|glob(?:_file_search)?|file_search|"
     r"semantic_search|search|web_search|websearch|webfetch|fetch_webpage|"
+    r"run_in_terminal|runinterminal|bash|shell|powershell|execute_command|run_command|"
+    r"write|edit|create|create_file|createfile|write_file|writefile|edit_file|editfile|"
+    r"apply_patch|applypatch|multiedit|multi_edit|notebookedit|notebook_edit|"
+    r"str_replace_editor|replace_string_in_file|insert_edit_into_file|"
+    r"multi_replace_string_in_file|patch_file|"
     r"mcp__.+__(?:read|grep|glob|search|fetch)[A-Za-z0-9_]*)$",
     re.I,
 )
@@ -59,7 +64,7 @@ def main() -> int:
     if not isinstance(body, dict):
         return 3
     tool_name = str(body.get("tool_name") or body.get("toolName") or body.get("tool") or "")
-    if not READ_TOOLS.fullmatch(tool_name):
+    if not STEP_TOOLS.fullmatch(tool_name):
         return 3
     if "result" not in body:
         for key in ("tool_response", "toolResponse", "tool_output", "toolOutput", "output"):
@@ -75,8 +80,10 @@ def main() -> int:
     sanitized = json.dumps(_redact(body), separators=(",", ":"), default=str)
     if len(sanitized.encode()) > MAX_BODY:
         return 3
+    event = str(body.get("hook_event_name") or body.get("hookEventName") or "").lower()
+    is_post = "post" in event
     result = body.get("result")
-    if result in (None, "", {}, []):
+    if is_post and result in (None, "", {}, []):
         return 3
     sys.stdout.write(sanitized)
     return 0
