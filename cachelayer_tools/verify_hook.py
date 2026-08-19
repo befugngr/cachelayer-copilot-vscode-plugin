@@ -24,10 +24,10 @@ EMPTY = "{}"
 
 # VS Code can ignore matchers, so aliases and deny-lists are enforced here.
 _EDIT_ALIASES = {
-    "applypatch", "apply_patch", "edit", "editfile", "edit_file", "write",
-    "writefile", "write_file", "multiedit", "multi_edit", "notebookedit",
-    "notebook_edit", "create", "createfile", "create_file", "str_replace_editor",
-    "replace_string_in_file", "insert_edit_into_file",
+    "applypatch", "apply_patch", "edit", "editfile", "edit_file", "edit_files",
+    "writefile", "write_file", "write", "multiedit", "multi_edit", "notebookedit",
+    "notebook_edit", "create", "createfile", "create_file", "create_directory",
+    "str_replace_editor", "replace_string_in_file", "insert_edit_into_file",
     "multi_replace_string_in_file", "patch_file",
 }
 _NEVER = ("todo", "plan", "search", "fetch", "read", "grep", "glob", "view", "list", "mcp", "shell", "bash")
@@ -45,6 +45,7 @@ _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update)\s+File:\s*(.+?)\s*$", re.
 _TERMINAL_ALIASES = {
     "run_in_terminal", "runinterminal", "bash", "shell", "powershell",
     "execute_command", "run_command", "runcommand",
+    "runtests", "run_tests", "create_and_run_task", "run_task",
 }
 
 

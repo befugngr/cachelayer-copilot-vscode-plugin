@@ -3,14 +3,14 @@
     "PreToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|run_in_terminal|execute_command|run_command|Shell|Bash|Edit|Write|create_file|replace_string_in_file|insert_edit_into_file|mcp__.+__(read|grep|glob|search|fetch).*",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|read_project_structure|get_errors|get_changed_files|get_terminal_output|search_workspace_symbols|view_image|run_in_terminal|execute_command|run_command|runTests|run_tests|create_and_run_task|run_task|get_task_output|Shell|Bash|Edit|Write|create_file|create_directory|edit_files|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file|apply_patch|mcp__.+__(read|grep|glob|search|fetch).*",
         "command": "bash \"${PLUGIN_ROOT}/scripts/pre_tool_use.sh\"",
         "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\pre_tool_use.ps1\"",
         "timeout": 3
       },
       {
         "type": "command",
-        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command",
+        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command|runTests|run_tests|create_and_run_task|run_task",
         "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
         "timeout": 45,
         "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
@@ -19,21 +19,21 @@
     "PostToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|run_in_terminal|execute_command|run_command|Shell|Bash|mcp__.+__(read|grep|glob|search|fetch).*",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|read_project_structure|get_errors|get_changed_files|get_terminal_output|search_workspace_symbols|view_image|run_in_terminal|execute_command|run_command|runTests|run_tests|create_and_run_task|run_task|get_task_output|Shell|Bash|mcp__.+__(read|grep|glob|search|fetch).*",
         "command": "bash \"${PLUGIN_ROOT}/scripts/post_tool_use.sh\"",
         "timeout": 3,
         "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\post_tool_use.ps1\""
       },
       {
         "type": "command",
-        "matcher": "Edit|Write|ApplyPatch|MultiEdit|NotebookEdit|create|edit|apply_patch|create_file|edit_file|write_file|patch_file|str_replace_editor|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
+        "matcher": "Edit|Write|ApplyPatch|MultiEdit|NotebookEdit|create|edit|apply_patch|create_file|create_directory|edit_file|edit_files|write_file|patch_file|str_replace_editor|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
         "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
         "timeout": 45,
         "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
       },
       {
         "type": "command",
-        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command",
+        "matcher": "Shell|Bash|run_in_terminal|execute_command|run_command|runTests|run_tests|create_and_run_task|run_task",
         "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
         "timeout": 45,
         "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""

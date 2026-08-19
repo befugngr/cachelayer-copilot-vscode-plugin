@@ -24,11 +24,15 @@ SECRET_VALUE = re.compile(
     re.S,
 )
 STEP_TOOLS = re.compile(
-    r"^(?:read(?:_file)?|readfile|view|open_file|list_dir|"
+    r"^(?:read(?:_file)?|readfile|view(?:_image)?|open_file|list_dir|"
+    r"read_project_structure|get_errors|get_changed_files|get_terminal_output|"
+    r"search_workspace_symbols|"
     r"grep(?:_search)?|glob(?:_file_search)?|file_search|"
     r"semantic_search|search|web_search|websearch|webfetch|fetch_webpage|"
     r"run_in_terminal|runinterminal|bash|shell|powershell|execute_command|run_command|"
-    r"write|edit|create|create_file|createfile|write_file|writefile|edit_file|editfile|"
+    r"runTests|run_tests|create_and_run_task|run_task|get_task_output|"
+    r"write|edit|create|create_file|createfile|create_directory|"
+    r"write_file|writefile|edit_file|editfile|edit_files|"
     r"apply_patch|applypatch|multiedit|multi_edit|notebookedit|notebook_edit|"
     r"str_replace_editor|replace_string_in_file|insert_edit_into_file|"
     r"multi_replace_string_in_file|patch_file|"
