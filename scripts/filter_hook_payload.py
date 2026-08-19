@@ -24,7 +24,9 @@ SECRET_VALUE = re.compile(
     re.S,
 )
 READ_TOOLS = re.compile(
-    r"^(?:read|grep|glob|search|websearch|webfetch|"
+    r"^(?:read(?:_file)?|readfile|view|open_file|list_dir|"
+    r"grep(?:_search)?|glob(?:_file_search)?|file_search|"
+    r"semantic_search|search|web_search|websearch|webfetch|fetch_webpage|"
     r"mcp__.+__(?:read|grep|glob|search|fetch)[A-Za-z0-9_]*)$",
     re.I,
 )

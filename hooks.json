@@ -3,26 +3,26 @@
     "PreToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|mcp__.+__(read|grep|glob|search|fetch).*",
-        "command": "bash scripts/pre_tool_use.sh",
-        "windows": "powershell -File scripts\\pre_tool_use.ps1",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|mcp__.+__(read|grep|glob|search|fetch).*",
+        "command": "bash \"${PLUGIN_ROOT}/scripts/pre_tool_use.sh\"",
+        "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\pre_tool_use.ps1\"",
         "timeout": 3
       }
     ],
     "PostToolUse": [
       {
         "type": "command",
-        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|mcp__.+__(read|grep|glob|search|fetch).*",
-        "command": "bash scripts/post_tool_use.sh",
+        "matcher": "Read|Grep|Glob|WebSearch|WebFetch|read_file|grep_search|file_search|list_dir|semantic_search|web_search|fetch_webpage|mcp__.+__(read|grep|glob|search|fetch).*",
+        "command": "bash \"${PLUGIN_ROOT}/scripts/post_tool_use.sh\"",
         "timeout": 3,
-        "windows": "powershell -File scripts\\post_tool_use.ps1"
+        "windows": "powershell -NoProfile -File \"${PLUGIN_ROOT}\\scripts\\post_tool_use.ps1\""
       },
       {
         "type": "command",
         "matcher": "Edit|Write|ApplyPatch|MultiEdit|NotebookEdit|create|edit|apply_patch|create_file|edit_file|write_file|patch_file|str_replace_editor|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file",
-        "command": "bash -c 'for d in \"$CLAUDE_PLUGIN_ROOT\" \"$PLUGIN_ROOT\" .; do [ -n \"$d\" ] && [ -f \"$d/cachelayer_tools/run_verify_hook.sh\" ] && exec bash \"$d/cachelayer_tools/run_verify_hook.sh\"; done; printf \"{}\\n\"'",
+        "command": "bash \"${PLUGIN_ROOT}/cachelayer_tools/run_verify_hook.sh\"",
         "timeout": 15,
-        "windows": "cachelayer_tools\\run_verify_hook.cmd"
+        "windows": "cmd.exe /c \"${PLUGIN_ROOT}\\cachelayer_tools\\run_verify_hook.cmd\""
       }
     ]
   }
