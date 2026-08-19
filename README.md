@@ -54,21 +54,3 @@ launchctl setenv CACHELAYER_KEY 'clct_<your-token>'
 ## 4. Restart VS Code
 
 Fully quit and reopen VS Code.
-
-## Update or reinstall manually
-
-Auto-update only works after step 1 is done and can take up to 24 hours. To get the latest version immediately:
-
-1. Command Palette → **Chat: Install Plugin From Source**
-2. Paste the same URL again: `https://github.com/befugngr/cachelayer-copilot-vscode-plugin`
-3. Confirm reinstall when prompted (or uninstall first: Extensions view → `@agentPlugins` → CacheLayer → Uninstall, then install again)
-4. Command Palette → **Extensions: Check for Extension Updates** (optional nudge)
-5. Fully quit and reopen VS Code
-
-To confirm version: Extensions view → `@agentPlugins` → CacheLayer → check version (needs **1.0.5+** for the MCP fix).
-
-## Troubleshooting
-
-**`Variable workspaceFolder can not be resolved` when starting `cachelayer-agent`**
-
-Update to plugin **1.0.5+** (see above). If you pasted MCP config manually, remove any `"env": { "CACHELAYER_WORKSPACE_ROOT": "${workspaceFolder}" }` block.
