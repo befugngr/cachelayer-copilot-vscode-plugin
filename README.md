@@ -6,6 +6,20 @@ CacheLayer Agent OS sits in front of the LLM: it clears the agent’s memory and
 
 Personal / BYOK: https://cachelayer.org/integrations/github-copilot
 
+## Agent OS (LLM traffic)
+
+Point the model at CacheLayer Agent OS so it clears memory and only gives the agent what the current step needs:
+
+```bash
+export OPENAI_BASE_URL="https://api.cachelayer.org/cl-gate/v1"
+export OPENAI_API_KEY="$CACHELAYER_KEY"
+# Optional Anthropic-shaped clients:
+# export ANTHROPIC_BASE_URL="https://api.cachelayer.org/cl-gate"
+# export ANTHROPIC_API_KEY="$CACHELAYER_KEY"
+```
+
+Hooks and MCP stay on `https://api.cachelayer.org` (unchanged).
+
 ## 1. Required VS Code settings
 
 Add these to your **User** `settings.json` (Command Palette → **Preferences: Open User Settings (JSON)**):
