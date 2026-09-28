@@ -1,6 +1,6 @@
 {
   "name": "cachelayer",
-  "description": "CacheLayer for GitHub Copilot in VS Code. Connect token (CACHELAYER_KEY) enables hooks and MCP. Agent OS clears agent memory and only gives what the current step needs.",
+  "description": "CacheLayer managed keys for GitHub Copilot in VS Code. Connect token (CACHELAYER_KEY) enables hooks and MCP.",
   "version": "1.0.8",
   "author": {
     "name": "CacheLayer",
