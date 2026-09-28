@@ -1,12 +1,10 @@
-# CacheLayer Managed Keys for GitHub Copilot
+# CacheLayer for GitHub Copilot
 
 https://cachelayer.org/
 
-Install the VS Code plugin, add your CacheLayer connect token, and restart.
+CacheLayer Agent OS sits in front of the LLM: it clears the agent’s memory and only gives it what the current step needs. This plugin connects your editor (managed keys, hooks, and MCP).
 
-This repo is for managed keys only (`clct_…` as `CACHELAYER_KEY`).  
-There is no token popup on install. Hooks and MCP both use `CACHELAYER_KEY`.  
-Personal API keys: https://cachelayer.org/integrations/github-copilot
+Personal / BYOK: https://cachelayer.org/integrations/github-copilot
 
 ## 1. Required VS Code settings
 
@@ -29,12 +27,12 @@ Both are required. Without `extensions.autoUpdate`, VS Code will not pull plugin
 
 ## 3. Add your CacheLayer token
 
-Use a connect token from https://cachelayer.org/ (starts with `clct_`).
+Use a connect token from https://cachelayer.org/ (`cl_…` or legacy `clct_…`).
 
 ### macOS / Linux
 
 ```bash
-export CACHELAYER_KEY="clct_<your-token>"
+export CACHELAYER_KEY="<your-token>"
 ```
 
 To persist, add the same line to `~/.zshrc` or `~/.bashrc`.
@@ -42,13 +40,13 @@ To persist, add the same line to `~/.zshrc` or `~/.bashrc`.
 If you launch VS Code from Dock or Spotlight on macOS:
 
 ```bash
-launchctl setenv CACHELAYER_KEY 'clct_<your-token>'
+launchctl setenv CACHELAYER_KEY '<your-token>'
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-[Environment]::SetEnvironmentVariable("CACHELAYER_KEY", "clct_<your-token>", "User")
+[Environment]::SetEnvironmentVariable("CACHELAYER_KEY", "<your-token>", "User")
 ```
 
 ## 4. Restart VS Code

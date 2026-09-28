@@ -7,7 +7,7 @@ description: >-
 
 # CacheLayer tools
 
-Set `CACHELAYER_KEY` to `clct_<token>`. Silent read/search hooks lookup and save. Local tools still must run after edits and failures.
+Set `CACHELAYER_KEY` to `cl_…` or `clct_…`. Silent read/search hooks lookup and save. Local tools still must run after edits and failures.
 
 ## Required after code edits
 
