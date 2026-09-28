@@ -7,10 +7,7 @@ description: >-
 
 # CacheLayer tools
 
-Silent hooks are the control plane (lookup before read/search; put cached result back on hit). Set `CACHELAYER_FLOW_ID` for per-flow Agent OS metrics.
-
-
-Set `CACHELAYER_KEY` to `cl_…` or `clct_…`. Silent read/search hooks lookup and save. Local tools still must run after edits and failures.
+Set `CACHELAYER_KEY` to `cl_<token>`. Silent read/search hooks lookup and save. Local tools still must run after edits and failures.
 
 ## Required after code edits
 

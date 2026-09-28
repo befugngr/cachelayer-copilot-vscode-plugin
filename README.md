@@ -1,28 +1,12 @@
-# CacheLayer for GitHub Copilot
+# CacheLayer Managed Keys for GitHub Copilot
 
 https://cachelayer.org/
 
-CacheLayer controls the agent through silent tool hooks and MCP — not by proxying the LLM. Hooks look up/save steps and put only the needed cached result back on a hit.
+Install the VS Code plugin, add your CacheLayer connect token, and restart.
 
-Personal / BYOK: https://cachelayer.org/integrations/github-copilot
-
-## How CacheLayer controls the agent
-
-The plugin does **not** attach your editor to the LLM proxy. Silent hooks sit on tool use:
-
-1. **Before** allowlisted read/search tools → lookup a prior safe step result
-2. On **hit** → skip the native tool and put only that cached result back into the agent
-3. **After** the tool → save the result for the next step
-4. Optional MCP tools (`lookup_step`, `save_step`, `check_conflict`, `run_status`) for explicit control
-
-Set `CACHELAYER_KEY` (`cl_…` or legacy `clct_…`). For per-flow Agent OS metrics in the console:
-
-```bash
-export CACHELAYER_FLOW_ID="<flow_id_from_console>"
-```
-
-Hooks and MCP stay on `https://api.cachelayer.org`.
-
+This repo is for managed keys only (`cl_…` as `CACHELAYER_KEY`).  
+There is no token popup on install. Hooks and MCP both use `CACHELAYER_KEY`.  
+Personal API keys: https://cachelayer.org/integrations/github-copilot
 
 ## 1. Required VS Code settings
 
@@ -45,12 +29,12 @@ Both are required. Without `extensions.autoUpdate`, VS Code will not pull plugin
 
 ## 3. Add your CacheLayer token
 
-Use a connect token from https://cachelayer.org/ (`cl_…` or legacy `clct_…`).
+Use a connect token from https://cachelayer.org/ (starts with `cl_`).
 
 ### macOS / Linux
 
 ```bash
-export CACHELAYER_KEY="<your-token>"
+export CACHELAYER_KEY="cl_<your-token>"
 ```
 
 To persist, add the same line to `~/.zshrc` or `~/.bashrc`.
@@ -58,13 +42,13 @@ To persist, add the same line to `~/.zshrc` or `~/.bashrc`.
 If you launch VS Code from Dock or Spotlight on macOS:
 
 ```bash
-launchctl setenv CACHELAYER_KEY '<your-token>'
+launchctl setenv CACHELAYER_KEY 'cl_<your-token>'
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-[Environment]::SetEnvironmentVariable("CACHELAYER_KEY", "<your-token>", "User")
+[Environment]::SetEnvironmentVariable("CACHELAYER_KEY", "cl_<your-token>", "User")
 ```
 
 ## 4. Restart VS Code
