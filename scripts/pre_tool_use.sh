@@ -6,6 +6,12 @@ URL="${CACHELAYER_HOOK_URL:-https://api.cachelayer.org/hooks/pre-tool-use}"
 TOKEN="${CACHELAYER_KEY:-${CACHELAYER_TOKEN:-${CACHELAYER_CONNECT_TOKEN:-}}}"
 TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-2}"
 
+FLOW_HDR=()
+if [[ -n "${CACHELAYER_FLOW_ID:-}" ]]; then
+  FLOW_HDR=(-H "x-amg-flow: ${CACHELAYER_FLOW_ID}")
+fi
+
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 allow() {
   printf '%s\n' "{\"continue\":true,\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"$1\",\"additionalContext\":\"CacheLayer lookup: $1\"}}"
@@ -31,6 +37,7 @@ RESP="$(curl -sS --max-time "$TIMEOUT" \
   -X POST "$URL" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${TOKEN}" \
+  "${FLOW_HDR[@]}" \
   -d "$INPUT" 2>/dev/null || true)"
 
 if [[ -z "$RESP" ]]; then

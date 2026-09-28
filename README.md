@@ -2,30 +2,27 @@
 
 https://cachelayer.org/
 
-CacheLayer Agent OS sits in front of the LLM: it clears the agent’s memory and only gives it what the current step needs. This plugin connects your editor (managed keys, hooks, and MCP).
+CacheLayer controls the agent through silent tool hooks and MCP — not by proxying the LLM. Hooks look up/save steps and put only the needed cached result back on a hit.
 
 Personal / BYOK: https://cachelayer.org/integrations/github-copilot
 
-## Agent OS (LLM traffic)
+## How CacheLayer controls the agent
 
-Point the model at CacheLayer Agent OS so it clears memory and only gives the agent what the current step needs:
+The plugin does **not** attach your editor to the LLM proxy. Silent hooks sit on tool use:
+
+1. **Before** allowlisted read/search tools → lookup a prior safe step result
+2. On **hit** → skip the native tool and put only that cached result back into the agent
+3. **After** the tool → save the result for the next step
+4. Optional MCP tools (`lookup_step`, `save_step`, `check_conflict`, `run_status`) for explicit control
+
+Set `CACHELAYER_KEY` (`cl_…` or legacy `clct_…`). For per-flow Agent OS metrics in the console:
 
 ```bash
-export OPENAI_BASE_URL="https://api.cachelayer.org/cl-gate/v1"
-export OPENAI_API_KEY="sk-<your-provider-key>"
-# CacheLayer org key (Portfolio cl_… / legacy clct_…):
-export CACHELAYER_KEY="cl_<your-org-key>"
-# Clients that support custom headers must send:
-#   x-api-key: $CACHELAYER_KEY
-# Authorization stays the provider sk- key.
-# Optional Anthropic-shaped clients:
-# export ANTHROPIC_BASE_URL="https://api.cachelayer.org/cl-gate"
-# export ANTHROPIC_API_KEY="sk-ant-<your-provider-key>"
+export CACHELAYER_FLOW_ID="<flow_id_from_console>"
 ```
 
-For per-flow Agent OS metrics in the console, also send header `x-amg-flow: <flow_id>`.
+Hooks and MCP stay on `https://api.cachelayer.org`.
 
-Hooks and MCP stay on `https://api.cachelayer.org` (unchanged) with `Authorization: Bearer $CACHELAYER_KEY`.
 
 ## 1. Required VS Code settings
 

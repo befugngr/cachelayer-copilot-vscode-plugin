@@ -7,7 +7,7 @@ description: >-
 
 # CacheLayer tools
 
-For LLM calls through Agent OS: `OPENAI_BASE_URL=https://api.cachelayer.org/cl-gate/v1`, `OPENAI_API_KEY=sk-…` (provider), and header `x-api-key: $CACHELAYER_KEY` (Portfolio `cl_…`).
+Silent hooks are the control plane (lookup before read/search; put cached result back on hit). Set `CACHELAYER_FLOW_ID` for per-flow Agent OS metrics.
 
 
 Set `CACHELAYER_KEY` to `cl_…` or `clct_…`. Silent read/search hooks lookup and save. Local tools still must run after edits and failures.

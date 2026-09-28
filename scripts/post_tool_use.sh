@@ -5,6 +5,12 @@ URL="${CACHELAYER_POST_HOOK_URL:-https://api.cachelayer.org/hooks/post-tool-use}
 TOKEN="${CACHELAYER_KEY:-${CACHELAYER_TOKEN:-${CACHELAYER_CONNECT_TOKEN:-}}}"
 TIMEOUT="${CACHELAYER_HOOK_TIMEOUT_S:-2}"
 
+FLOW_HDR=()
+if [[ -n "${CACHELAYER_FLOW_ID:-}" ]]; then
+  FLOW_HDR=(-H "x-amg-flow: ${CACHELAYER_FLOW_ID}")
+fi
+
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 note() {
   printf '%s\n' "{\"continue\":true,\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"CacheLayer save: $1\"}}"
@@ -28,6 +34,7 @@ RESP="$(curl -sS --max-time "$TIMEOUT" \
   -X POST "$URL" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${TOKEN}" \
+  "${FLOW_HDR[@]}" \
   -d "$INPUT" 2>/dev/null || true)"
 
 if [[ -z "$RESP" ]]; then
