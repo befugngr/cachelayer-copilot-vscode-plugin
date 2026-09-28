@@ -12,13 +12,18 @@ Point the model at CacheLayer Agent OS so it clears memory and only gives the ag
 
 ```bash
 export OPENAI_BASE_URL="https://api.cachelayer.org/cl-gate/v1"
-export OPENAI_API_KEY="$CACHELAYER_KEY"
+export OPENAI_API_KEY="sk-<your-provider-key>"
+# CacheLayer org key (Portfolio cl_… / legacy clct_…):
+export CACHELAYER_KEY="cl_<your-org-key>"
+# Clients that support custom headers must send:
+#   x-api-key: $CACHELAYER_KEY
+# Authorization stays the provider sk- key.
 # Optional Anthropic-shaped clients:
 # export ANTHROPIC_BASE_URL="https://api.cachelayer.org/cl-gate"
-# export ANTHROPIC_API_KEY="$CACHELAYER_KEY"
+# export ANTHROPIC_API_KEY="sk-ant-<your-provider-key>"
 ```
 
-Hooks and MCP stay on `https://api.cachelayer.org` (unchanged).
+Hooks and MCP stay on `https://api.cachelayer.org` (unchanged) with `Authorization: Bearer $CACHELAYER_KEY`.
 
 ## 1. Required VS Code settings
 
