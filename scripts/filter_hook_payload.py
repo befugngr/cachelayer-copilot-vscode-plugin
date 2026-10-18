@@ -29,13 +29,6 @@ STEP_TOOLS = re.compile(
     r"search_workspace_symbols|"
     r"grep(?:_search)?|glob(?:_file_search)?|file_search|"
     r"semantic_search|search|web_search|websearch|webfetch|fetch_webpage|"
-    r"run_in_terminal|runinterminal|bash|shell|powershell|execute_command|run_command|"
-    r"runTests|run_tests|create_and_run_task|run_task|get_task_output|"
-    r"write|edit|create|create_file|createfile|create_directory|"
-    r"write_file|writefile|edit_file|editfile|edit_files|"
-    r"apply_patch|applypatch|multiedit|multi_edit|notebookedit|notebook_edit|"
-    r"str_replace_editor|replace_string_in_file|insert_edit_into_file|"
-    r"multi_replace_string_in_file|patch_file|"
     r"mcp__.+__(?:read|grep|glob|search|fetch)[A-Za-z0-9_]*)$",
     re.I,
 )
