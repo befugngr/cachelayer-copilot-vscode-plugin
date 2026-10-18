@@ -5,19 +5,13 @@ $Token = if ($env:CACHELAYER_KEY) { $env:CACHELAYER_KEY } elseif ($env:CACHELAYE
 $TimeoutSec = 5
 if ($env:CACHELAYER_HOOK_TIMEOUT_S) { [void][int]::TryParse($env:CACHELAYER_HOOK_TIMEOUT_S, [ref]$TimeoutSec) }
 
-function Write-Note([string]$Msg) {
-  Write-Output (@{
-    continue = $true
-    hookSpecificOutput = @{
-      hookEventName = 'PostToolUse'
-      additionalContext = "CacheLayer save: $Msg"
-    }
-  } | ConvertTo-Json -Compress -Depth 6)
+function Write-Done {
+  Write-Output '{"continue":true,"hookSpecificOutput":{"hookEventName":"PostToolUse"}}'
 }
 
 $InputJson = [Console]::In.ReadToEnd()
 if ([string]::IsNullOrWhiteSpace($Token) -or $InputJson.Length -gt 262144) {
-  Write-Note 'no_token_or_too_large'
+  Write-Done
   exit 0
 }
 $Filter = Join-Path $PSScriptRoot 'filter_hook_payload.py'
@@ -26,25 +20,18 @@ if (Get-Command py -ErrorAction SilentlyContinue) { $PyCmd = 'py'; $PyArgs = @('
 elseif (Get-Command python3 -ErrorAction SilentlyContinue) { $PyCmd = 'python3'; $PyArgs = @($Filter) }
 elseif (Get-Command python -ErrorAction SilentlyContinue) { $PyCmd = 'python'; $PyArgs = @($Filter) }
 else {
-  Write-Note 'no_python'
+  Write-Done
   exit 0
 }
 $InputJson = $InputJson | & $PyCmd @PyArgs
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($InputJson)) {
-  Write-Note 'skipped_non_read_or_secret'
+  Write-Done
   exit 0
 }
-try {
-  $resp = Invoke-RestMethod -Method Post -Uri $Url -Headers @{
-    'Content-Type' = 'application/json'
-    'Authorization' = "Bearer $Token"
-  } -Body $InputJson -TimeoutSec $TimeoutSec
-  if ($resp.stored) {
-    Write-Note ("SAVED " + [string]($resp.description -as [string]))
-  } else {
-    Write-Note ("NOT STORED: " + [string]($resp.reason -as [string]))
-  }
-} catch {
-  Write-Note 'save_unreachable'
-}
+$tmp = [System.IO.Path]::GetTempFileName()
+Set-Content -Path $tmp -Value $InputJson -Encoding utf8
+$flow = @()
+if ($env:CACHELAYER_FLOW_ID) { $flow = @('-H', "x-cachelayer-flow: $($env:CACHELAYER_FLOW_ID)") }
+Start-Process -FilePath curl.exe -ArgumentList (@('-sS','--max-time','5','-X','POST',$Url,'-H','Content-Type: application/json','-H',"Authorization: Bearer $Token") + $flow + @('--data-binary',"@$tmp")) -WindowStyle Hidden | Out-Null
+Write-Done
 exit 0

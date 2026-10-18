@@ -2,7 +2,7 @@
 $ErrorActionPreference = 'SilentlyContinue'
 $Url = if ($env:CACHELAYER_HOOK_URL) { $env:CACHELAYER_HOOK_URL } else { 'https://api.cachelayer.org/hooks/pre-tool-use' }
 $Token = if ($env:CACHELAYER_KEY) { $env:CACHELAYER_KEY } elseif ($env:CACHELAYER_TOKEN) { $env:CACHELAYER_TOKEN } elseif ($env:CACHELAYER_CONNECT_TOKEN) { $env:CACHELAYER_CONNECT_TOKEN } else { '' }
-$TimeoutSec = 5
+$TimeoutSec = 1
 if ($env:CACHELAYER_HOOK_TIMEOUT_S) { [void][int]::TryParse($env:CACHELAYER_HOOK_TIMEOUT_S, [ref]$TimeoutSec) }
 
 function Write-Allow([string]$Reason) {
@@ -12,7 +12,6 @@ function Write-Allow([string]$Reason) {
       hookEventName = 'PreToolUse'
       permissionDecision = 'allow'
       permissionDecisionReason = $Reason
-      additionalContext = "CacheLayer lookup: $Reason"
     }
   } | ConvertTo-Json -Compress -Depth 8)
 }
@@ -61,22 +60,19 @@ try {
   if (-not $hit -and $cl) { $hit = [bool]$cl.hit }
   $result = $resp.result
   if ($null -eq $result -and $cl) { $result = $cl.result }
-  if ($err) {
-    $hso.permissionDecision = 'allow'
-    $hso.permissionDecisionReason = [string]$err
-    $hso.additionalContext = "CacheLayer lookup error: $err"
-  } elseif ($hit -and $null -ne $result) {
+  $hso.Remove('additionalContext')
+  if (-not $err -and $hit -and $null -ne $result) {
     $rendered = if ($result -is [string]) { $result } else { ($result | ConvertTo-Json -Compress -Depth 20) }
     $hso.permissionDecision = 'deny'
     $hso.permissionDecisionReason = 'cache_hit'
     $hso.additionalContext = "CacheLayer HIT. Use this cached result and do not re-read:`n$rendered"
+    $toolOut = if ($resp.updatedToolOutput) { $resp.updatedToolOutput } else { $result }
+    $out = @{ continue = $false; hookSpecificOutput = $hso; updatedToolOutput = $toolOut }
   } else {
     $hso.permissionDecision = 'allow'
-    $hso.permissionDecisionReason = 'cache_miss'
-    $hso.additionalContext = 'CacheLayer MISS. Native read will run; post-hook will try to save.'
+    $hso.permissionDecisionReason = if ($err) { [string]$err } else { 'cache_miss' }
+    $out = @{ continue = $true; hookSpecificOutput = $hso }
   }
-  $out = @{ continue = $true; hookSpecificOutput = $hso }
-  if ($cl) { $out.cachelayer = $cl }
   Write-Output ($out | ConvertTo-Json -Compress -Depth 30)
   exit 0
 } catch {
